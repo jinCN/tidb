@@ -14,12 +14,15 @@
 package ddl
 
 import (
+	"context"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/tidb/table/tables"
+	"github.com/pingcap/tidb/types"
 )
 
 type testCtxKeyType int
@@ -34,127 +37,200 @@ func (s *testDDLSuite) TestReorg(c *C) {
 	store := testCreateStore(c, "test_reorg")
 	defer store.Close()
 
-	lease := 50 * time.Millisecond
-	d := newDDL(store, nil, nil, lease)
-	defer d.close()
+	d := testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(store),
+		WithLease(testLease),
+	)
+	defer d.Stop()
 
-	time.Sleep(lease)
+	time.Sleep(testLease)
 
-	ctx := testNewContext(c, d)
+	ctx := testNewContext(d)
 
 	ctx.SetValue(testCtxKey, 1)
 	c.Assert(ctx.Value(testCtxKey), Equals, 1)
 	ctx.ClearValue(testCtxKey)
 
-	txn, err := ctx.GetTxn(true)
+	err := ctx.NewTxn(context.Background())
 	c.Assert(err, IsNil)
-	txn.Set([]byte("a"), []byte("b"))
-	err = ctx.FinishTxn(true)
+	txn, err := ctx.Txn(true)
 	c.Assert(err, IsNil)
-
-	txn, err = ctx.GetTxn(false)
+	err = txn.Set([]byte("a"), []byte("b"))
 	c.Assert(err, IsNil)
-	txn.Set([]byte("a"), []byte("b"))
-	err = ctx.FinishTxn(false)
+	err = txn.Rollback()
 	c.Assert(err, IsNil)
 
-	done := make(chan struct{})
+	err = ctx.NewTxn(context.Background())
+	c.Assert(err, IsNil)
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Set([]byte("a"), []byte("b"))
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
+
+	rowCount := int64(10)
+	handle := s.NewHandle().Int(100).Common("a", 100, "string")
 	f := func() error {
-		time.Sleep(200 * time.Millisecond)
-		close(done)
+		d.generalWorker().reorgCtx.setRowCount(rowCount)
+		d.generalWorker().reorgCtx.setNextKey(handle.Encoded())
+		time.Sleep(1*ReorgWaitTimeout + 100*time.Millisecond)
 		return nil
 	}
-	err = d.runReorgJob(f)
-	c.Assert(err, NotNil)
-
-	<-done
-	err = d.runReorgJob(f)
-	c.Assert(err, IsNil)
-
-	d.close()
-	err = d.runReorgJob(func() error {
-		time.Sleep(1 * time.Second)
-		return nil
-	})
-	c.Assert(err, NotNil)
-	d.start()
-
 	job := &model.Job{
-		ID:       1,
-		SchemaID: 1,
-		Type:     model.ActionCreateSchema,
-		Args:     []interface{}{model.NewCIStr("test")},
+		ID:          1,
+		SnapshotVer: 1, // Make sure it is not zero. So the reorgInfo's first is false.
+	}
+	err = ctx.NewTxn(context.Background())
+	c.Assert(err, IsNil)
+	txn, err = ctx.Txn(true)
+	c.Assert(err, IsNil)
+	m := meta.NewMeta(txn)
+	e := &meta.Element{ID: 333, TypeKey: meta.IndexElementKey}
+	rInfo := &reorgInfo{
+		Job:         job,
+		currElement: e,
+	}
+	mockTbl := tables.MockTableFromMeta(&model.TableInfo{IsCommonHandle: s.IsCommonHandle})
+	err = d.generalWorker().runReorgJob(m, rInfo, mockTbl.Meta(), d.lease, f)
+	c.Assert(err, NotNil)
+
+	// The longest to wait for 5 seconds to make sure the function of f is returned.
+	for i := 0; i < 1000; i++ {
+		time.Sleep(5 * time.Millisecond)
+		err = d.generalWorker().runReorgJob(m, rInfo, mockTbl.Meta(), d.lease, f)
+		if err == nil {
+			c.Assert(job.RowCount, Equals, rowCount)
+			c.Assert(d.generalWorker().reorgCtx.rowCount, Equals, int64(0))
+
+			// Test whether reorgInfo's Handle is update.
+			err = txn.Commit(context.Background())
+			c.Assert(err, IsNil)
+			err = ctx.NewTxn(context.Background())
+			c.Assert(err, IsNil)
+
+			m = meta.NewMeta(txn)
+			info, err1 := getReorgInfo(d.ddlCtx, m, job, mockTbl, nil)
+			c.Assert(err1, IsNil)
+			c.Assert(info.StartKey, DeepEquals, kv.Key(handle.Encoded()))
+			c.Assert(info.currElement, DeepEquals, e)
+			_, doneHandle, _ := d.generalWorker().reorgCtx.getRowCountAndKey()
+			c.Assert(doneHandle, IsNil)
+			break
+		}
+	}
+	c.Assert(err, IsNil)
+
+	job = &model.Job{
+		ID:          2,
+		SchemaID:    1,
+		Type:        model.ActionCreateSchema,
+		Args:        []interface{}{model.NewCIStr("test")},
+		SnapshotVer: 1, // Make sure it is not zero. So the reorgInfo's first is false.
 	}
 
-	var info *reorgInfo
-	err = kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
+	element := &meta.Element{ID: 123, TypeKey: meta.ColumnElementKey}
+	info := &reorgInfo{
+		Job:             job,
+		d:               d.ddlCtx,
+		currElement:     element,
+		StartKey:        s.NewHandle().Int(1).Common(100, "string").Encoded(),
+		EndKey:          s.NewHandle().Int(0).Common(101, "string").Encoded(),
+		PhysicalTableID: 456,
+	}
+	err = kv.RunInNewTxn(context.Background(), d.store, false, func(ctx context.Context, txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		var err1 error
-		info, err1 = d.getReorgInfo(t, job)
+		_, err1 = getReorgInfo(d.ddlCtx, t, job, mockTbl, []*meta.Element{element})
+		c.Assert(meta.ErrDDLReorgElementNotExist.Equal(err1), IsTrue)
+		c.Assert(job.SnapshotVer, Equals, uint64(0))
+		return nil
+	})
+	c.Assert(err, IsNil)
+	job.SnapshotVer = uint64(1)
+	err = info.UpdateReorgMeta(info.StartKey)
+	c.Assert(err, IsNil)
+	err = kv.RunInNewTxn(context.Background(), d.store, false, func(ctx context.Context, txn kv.Transaction) error {
+		t := meta.NewMeta(txn)
+		info1, err1 := getReorgInfo(d.ddlCtx, t, job, mockTbl, []*meta.Element{element})
 		c.Assert(err1, IsNil)
-		err1 = info.UpdateHandle(txn, 1)
-		c.Assert(err1, IsNil)
-
+		c.Assert(info1.currElement, DeepEquals, info.currElement)
+		c.Assert(info1.StartKey, DeepEquals, info.StartKey)
+		c.Assert(info1.EndKey, DeepEquals, info.EndKey)
+		c.Assert(info1.PhysicalTableID, Equals, info.PhysicalTableID)
 		return nil
 	})
 	c.Assert(err, IsNil)
 
-	err = kv.RunInNewTxn(d.store, false, func(txn kv.Transaction) error {
-		t := meta.NewMeta(txn)
-		var err1 error
-		info, err1 = d.getReorgInfo(t, job)
-		c.Assert(err1, IsNil)
-		c.Assert(info.Handle, Greater, int64(0))
+	d.Stop()
+	err = d.generalWorker().runReorgJob(m, rInfo, mockTbl.Meta(), d.lease, func() error {
+		time.Sleep(4 * testLease)
 		return nil
 	})
+	c.Assert(err, NotNil)
+	txn, err = ctx.Txn(true)
 	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
+	s.RerunWithCommonHandleEnabled(c, s.TestReorg)
 }
 
 func (s *testDDLSuite) TestReorgOwner(c *C) {
 	store := testCreateStore(c, "test_reorg_owner")
 	defer store.Close()
 
-	lease := 50 * time.Millisecond
+	d1 := testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(store),
+		WithLease(testLease),
+	)
+	defer d1.Stop()
 
-	d1 := newDDL(store, nil, nil, lease)
-	defer d1.close()
+	ctx := testNewContext(d1)
 
-	ctx := testNewContext(c, d1)
+	testCheckOwner(c, d1, true)
 
-	testCheckOwner(c, d1, true, ddlJobFlag)
-
-	d2 := newDDL(store, nil, nil, lease)
-	defer d2.close()
+	d2 := testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(store),
+		WithLease(testLease),
+	)
+	defer d2.Stop()
 
 	dbInfo := testSchemaInfo(c, d1, "test")
 	testCreateSchema(c, ctx, d1, dbInfo)
 
 	tblInfo := testTableInfo(c, d1, "t", 3)
 	testCreateTable(c, ctx, d1, dbInfo, tblInfo)
-
 	t := testGetTable(c, d1, dbInfo.ID, tblInfo.ID)
 
 	num := 10
 	for i := 0; i < num; i++ {
-		_, err := t.AddRecord(ctx, []interface{}{i, i, i})
+		_, err := t.AddRecord(ctx, types.MakeDatums(i, i, i))
 		c.Assert(err, IsNil)
 	}
 
-	err := ctx.FinishTxn(false)
+	txn, err := ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 
-	tc := &testDDLCallback{}
+	tc := &TestDDLCallback{}
 	tc.onJobRunBefore = func(job *model.Job) {
 		if job.SchemaState == model.StateDeleteReorganization {
-			d1.close()
+			d1.Stop()
 		}
 	}
 
-	d1.hook = tc
+	d1.SetHook(tc)
 
 	testDropSchema(c, ctx, d1, dbInfo)
 
-	err = kv.RunInNewTxn(d1.store, false, func(txn kv.Transaction) error {
+	err = kv.RunInNewTxn(context.Background(), d1.store, false, func(ctx context.Context, txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		db, err1 := t.GetDatabase(dbInfo.ID)
 		c.Assert(err1, IsNil)

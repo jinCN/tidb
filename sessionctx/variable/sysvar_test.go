@@ -17,9 +17,12 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -34,4 +37,53 @@ func (*testSysVarSuite) TestSysVar(c *C) {
 
 	f = GetSysVar("wrong-var-name")
 	c.Assert(f, IsNil)
+
+	f = GetSysVar("explicit_defaults_for_timestamp")
+	c.Assert(f, NotNil)
+	c.Assert(f.Value, Equals, "ON")
+
+	f = GetSysVar("port")
+	c.Assert(f, NotNil)
+	c.Assert(f.Value, Equals, "4000")
+
+	f = GetSysVar("tidb_low_resolution_tso")
+	c.Assert(f.Value, Equals, "OFF")
+
+	f = GetSysVar("tidb_replica_read")
+	c.Assert(f.Value, Equals, "leader")
+
+	f = GetSysVar("tidb_enable_table_partition")
+	c.Assert(f.Value, Equals, "ON")
+}
+
+func (*testSysVarSuite) TestTxnMode(c *C) {
+	seVar := NewSessionVars()
+	c.Assert(seVar, NotNil)
+	c.Assert(seVar.TxnMode, Equals, "")
+	err := seVar.setTxnMode("pessimistic")
+	c.Assert(err, IsNil)
+	err = seVar.setTxnMode("optimistic")
+	c.Assert(err, IsNil)
+	err = seVar.setTxnMode("")
+	c.Assert(err, IsNil)
+	err = seVar.setTxnMode("something else")
+	c.Assert(err, NotNil)
+}
+
+func (*testSysVarSuite) TestError(c *C) {
+	kvErrs := []*terror.Error{
+		ErrUnsupportedValueForVar,
+		ErrUnknownSystemVar,
+		ErrIncorrectScope,
+		ErrUnknownTimeZone,
+		ErrReadOnly,
+		ErrWrongValueForVar,
+		ErrWrongTypeForVar,
+		ErrTruncatedWrongValue,
+		ErrMaxPreparedStmtCountReached,
+		ErrUnsupportedIsolationLevel,
+	}
+	for _, err := range kvErrs {
+		c.Assert(terror.ToSQLError(err).Code != mysql.ErrUnknown, IsTrue)
+	}
 }

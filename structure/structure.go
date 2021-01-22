@@ -13,19 +13,36 @@
 
 package structure
 
-import "github.com/pingcap/tidb/kv"
+import (
+	mysql "github.com/pingcap/tidb/errno"
+	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/util/dbterror"
+)
 
-// NewStructure creates a TxStructure in transaction txn and with key prefix.
-func NewStructure(txn kv.Transaction, prefix []byte) *TxStructure {
+var (
+	// ErrInvalidHashKeyFlag used by structure
+	ErrInvalidHashKeyFlag = dbterror.ClassStructure.NewStd(mysql.ErrInvalidHashKeyFlag)
+	// ErrInvalidListIndex used by structure
+	ErrInvalidListIndex = dbterror.ClassStructure.NewStd(mysql.ErrInvalidListIndex)
+	// ErrInvalidListMetaData used by structure
+	ErrInvalidListMetaData = dbterror.ClassStructure.NewStd(mysql.ErrInvalidListMetaData)
+	// ErrWriteOnSnapshot used by structure
+	ErrWriteOnSnapshot = dbterror.ClassStructure.NewStd(mysql.ErrWriteOnSnapshot)
+)
+
+// NewStructure creates a TxStructure with Retriever, RetrieverMutator and key prefix.
+func NewStructure(reader kv.Retriever, readWriter kv.RetrieverMutator, prefix []byte) *TxStructure {
 	return &TxStructure{
-		txn:    txn,
-		prefix: prefix,
+		reader:     reader,
+		readWriter: readWriter,
+		prefix:     prefix,
 	}
 }
 
 // TxStructure supports some simple data structures like string, hash, list, etc... and
 // you can use these in a transaction.
 type TxStructure struct {
-	txn    kv.Transaction
-	prefix []byte
+	reader     kv.Retriever
+	readWriter kv.RetrieverMutator
+	prefix     []byte
 }

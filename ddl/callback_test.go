@@ -14,18 +14,57 @@
 package ddl
 
 import (
+	"context"
+
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/log"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/sessionctx"
+	"go.uber.org/zap"
 )
 
-type testDDLCallback struct {
-	*BaseCallback
+type TestInterceptor struct {
+	*BaseInterceptor
 
-	onJobRunBefore func(*model.Job)
-	onJobUpdated   func(*model.Job)
+	OnGetInfoSchemaExported func(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema
 }
 
-func (tc *testDDLCallback) OnJobRunBefore(job *model.Job) {
+func (ti *TestInterceptor) OnGetInfoSchema(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema {
+	if ti.OnGetInfoSchemaExported != nil {
+		return ti.OnGetInfoSchemaExported(ctx, is)
+	}
+
+	return ti.BaseInterceptor.OnGetInfoSchema(ctx, is)
+}
+
+type TestDDLCallback struct {
+	*BaseCallback
+	// We recommended to pass the domain parameter to the test ddl callback, it will ensure
+	// domain to reload schema before your ddl stepping into the next state change.
+	Do DomainReloader
+
+	onJobRunBefore         func(*model.Job)
+	OnJobRunBeforeExported func(*model.Job)
+	onJobUpdated           func(*model.Job)
+	OnJobUpdatedExported   func(*model.Job)
+	onWatched              func(ctx context.Context)
+}
+
+func (tc *TestDDLCallback) OnSchemaStateChanged() {
+	if tc.Do != nil {
+		if err := tc.Do.Reload(); err != nil {
+			log.Warn("reload failed on schema state changed", zap.Error(err))
+		}
+	}
+}
+
+func (tc *TestDDLCallback) OnJobRunBefore(job *model.Job) {
+	log.Info("on job run before", zap.String("job", job.String()))
+	if tc.OnJobRunBeforeExported != nil {
+		tc.OnJobRunBeforeExported(job)
+		return
+	}
 	if tc.onJobRunBefore != nil {
 		tc.onJobRunBefore(job)
 		return
@@ -34,7 +73,12 @@ func (tc *testDDLCallback) OnJobRunBefore(job *model.Job) {
 	tc.BaseCallback.OnJobRunBefore(job)
 }
 
-func (tc *testDDLCallback) OnJobUpdated(job *model.Job) {
+func (tc *TestDDLCallback) OnJobUpdated(job *model.Job) {
+	log.Info("on job updated", zap.String("job", job.String()))
+	if tc.OnJobUpdatedExported != nil {
+		tc.OnJobUpdatedExported(job)
+		return
+	}
 	if tc.onJobUpdated != nil {
 		tc.onJobUpdated(job)
 		return
@@ -43,9 +87,23 @@ func (tc *testDDLCallback) OnJobUpdated(job *model.Job) {
 	tc.BaseCallback.OnJobUpdated(job)
 }
 
+func (tc *TestDDLCallback) OnWatched(ctx context.Context) {
+	if tc.onWatched != nil {
+		tc.onWatched(ctx)
+		return
+	}
+
+	tc.BaseCallback.OnWatched(ctx)
+}
+
 func (s *testDDLSuite) TestCallback(c *C) {
 	cb := &BaseCallback{}
 	c.Assert(cb.OnChanged(nil), IsNil)
 	cb.OnJobRunBefore(nil)
 	cb.OnJobUpdated(nil)
+	cb.OnWatched(context.TODO())
+}
+
+type DomainReloader interface {
+	Reload() error
 }

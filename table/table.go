@@ -18,38 +18,160 @@
 package table
 
 import (
-	"fmt"
+	"context"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/column"
-	"github.com/pingcap/tidb/context"
+	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/parser/model"
+	mysql "github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/optimizer/evaluator"
-	"github.com/pingcap/tidb/sessionctx/db"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/dbterror"
+)
+
+// Type , the type of table, store data in different ways.
+type Type int16
+
+const (
+	// NormalTable stores data in tikv, mocktikv and so on.
+	NormalTable Type = iota
+	// VirtualTable stores no data, just extract data from the memory struct.
+	VirtualTable
+	// ClusterTable contains the `VirtualTable` in the all cluster tidb nodes.
+	ClusterTable
+)
+
+// IsNormalTable checks whether the table is a normal table type.
+func (tp Type) IsNormalTable() bool {
+	return tp == NormalTable
+}
+
+// IsVirtualTable checks whether the table is a virtual table type.
+func (tp Type) IsVirtualTable() bool {
+	return tp == VirtualTable
+}
+
+// IsClusterTable checks whether the table is a cluster table type.
+func (tp Type) IsClusterTable() bool {
+	return tp == ClusterTable
+}
+
+var (
+	// ErrColumnCantNull is used for inserting null to a not null column.
+	ErrColumnCantNull = dbterror.ClassTable.NewStd(mysql.ErrBadNull)
+	// ErrUnknownColumn is returned when accessing an unknown column.
+	ErrUnknownColumn   = dbterror.ClassTable.NewStd(mysql.ErrBadField)
+	errDuplicateColumn = dbterror.ClassTable.NewStd(mysql.ErrFieldSpecifiedTwice)
+
+	errGetDefaultFailed = dbterror.ClassTable.NewStd(mysql.ErrFieldGetDefaultFailed)
+
+	// ErrNoDefaultValue is used when insert a row, the column value is not given, and the column has not null flag
+	// and it doesn't have a default value.
+	ErrNoDefaultValue = dbterror.ClassTable.NewStd(mysql.ErrNoDefaultForField)
+	// ErrIndexOutBound returns for index column offset out of bound.
+	ErrIndexOutBound = dbterror.ClassTable.NewStd(mysql.ErrIndexOutBound)
+	// ErrUnsupportedOp returns for unsupported operation.
+	ErrUnsupportedOp = dbterror.ClassTable.NewStd(mysql.ErrUnsupportedOp)
+	// ErrRowNotFound returns for row not found.
+	ErrRowNotFound = dbterror.ClassTable.NewStd(mysql.ErrRowNotFound)
+	// ErrTableStateCantNone returns for table none state.
+	ErrTableStateCantNone = dbterror.ClassTable.NewStd(mysql.ErrTableStateCantNone)
+	// ErrColumnStateCantNone returns for column none state.
+	ErrColumnStateCantNone = dbterror.ClassTable.NewStd(mysql.ErrColumnStateCantNone)
+	// ErrColumnStateNonPublic returns for column non-public state.
+	ErrColumnStateNonPublic = dbterror.ClassTable.NewStd(mysql.ErrColumnStateNonPublic)
+	// ErrIndexStateCantNone returns for index none state.
+	ErrIndexStateCantNone = dbterror.ClassTable.NewStd(mysql.ErrIndexStateCantNone)
+	// ErrInvalidRecordKey returns for invalid record key.
+	ErrInvalidRecordKey = dbterror.ClassTable.NewStd(mysql.ErrInvalidRecordKey)
+	// ErrTruncatedWrongValueForField returns for truncate wrong value for field.
+	ErrTruncatedWrongValueForField = dbterror.ClassTable.NewStd(mysql.ErrTruncatedWrongValueForField)
+	// ErrUnknownPartition returns unknown partition error.
+	ErrUnknownPartition = dbterror.ClassTable.NewStd(mysql.ErrUnknownPartition)
+	// ErrNoPartitionForGivenValue returns table has no partition for value.
+	ErrNoPartitionForGivenValue = dbterror.ClassTable.NewStd(mysql.ErrNoPartitionForGivenValue)
+	// ErrLockOrActiveTransaction returns when execute unsupported statement in a lock session or an active transaction.
+	ErrLockOrActiveTransaction = dbterror.ClassTable.NewStd(mysql.ErrLockOrActiveTransaction)
+	// ErrSequenceHasRunOut returns when sequence has run out.
+	ErrSequenceHasRunOut = dbterror.ClassTable.NewStd(mysql.ErrSequenceRunOut)
+	// ErrRowDoesNotMatchGivenPartitionSet returns when the destination partition conflict with the partition selection.
+	ErrRowDoesNotMatchGivenPartitionSet = dbterror.ClassTable.NewStd(mysql.ErrRowDoesNotMatchGivenPartitionSet)
 )
 
 // RecordIterFunc is used for low-level record iteration.
-type RecordIterFunc func(h int64, rec []interface{}, cols []*column.Col) (more bool, err error)
+type RecordIterFunc func(h kv.Handle, rec []types.Datum, cols []*Column) (more bool, err error)
+
+// AddRecordOpt contains the options will be used when adding a record.
+type AddRecordOpt struct {
+	CreateIdxOpt
+	IsUpdate      bool
+	ReserveAutoID int
+}
+
+// AddRecordOption is defined for the AddRecord() method of the Table interface.
+type AddRecordOption interface {
+	ApplyOn(*AddRecordOpt)
+}
+
+// WithReserveAutoIDHint tells the AddRecord operation to reserve a batch of auto ID in the stmtctx.
+type WithReserveAutoIDHint int
+
+// ApplyOn implements the AddRecordOption interface.
+func (n WithReserveAutoIDHint) ApplyOn(opt *AddRecordOpt) {
+	opt.ReserveAutoID = int(n)
+}
+
+// ApplyOn implements the AddRecordOption interface, so any CreateIdxOptFunc
+// can be passed as the optional argument to the table.AddRecord method.
+func (f CreateIdxOptFunc) ApplyOn(opt *AddRecordOpt) {
+	f(&opt.CreateIdxOpt)
+}
+
+// IsUpdate is a defined value for AddRecordOptFunc.
+var IsUpdate AddRecordOption = isUpdate{}
+
+type isUpdate struct{}
+
+func (i isUpdate) ApplyOn(opt *AddRecordOpt) {
+	opt.IsUpdate = true
+}
 
 // Table is used to retrieve and modify rows in table.
 type Table interface {
 	// IterRecords iterates records in the table and calls fn.
-	IterRecords(ctx context.Context, startKey kv.Key, cols []*column.Col, fn RecordIterFunc) error
+	IterRecords(ctx sessionctx.Context, startKey kv.Key, cols []*Column, fn RecordIterFunc) error
 
 	// RowWithCols returns a row that contains the given cols.
-	RowWithCols(ctx context.Context, h int64, cols []*column.Col) ([]interface{}, error)
+	RowWithCols(ctx sessionctx.Context, h kv.Handle, cols []*Column) ([]types.Datum, error)
 
 	// Row returns a row for all columns.
-	Row(ctx context.Context, h int64) ([]interface{}, error)
+	Row(ctx sessionctx.Context, h kv.Handle) ([]types.Datum, error)
 
-	// Cols returns the columns of the table which is used in select.
-	Cols() []*column.Col
+	// Cols returns the columns of the table which is used in select, including hidden columns.
+	Cols() []*Column
+
+	// VisibleCols returns the columns of the table which is used in select, excluding hidden columns.
+	VisibleCols() []*Column
+
+	// HiddenCols returns the hidden columns of the table.
+	HiddenCols() []*Column
+
+	// WritableCols returns columns of the table in writable states.
+	// Writable states includes Public, WriteOnly, WriteOnlyReorganization.
+	WritableCols() []*Column
+
+	// FullHiddenColsAndVisibleCols returns hidden columns in all states and unhidden columns in public states.
+	FullHiddenColsAndVisibleCols() []*Column
 
 	// Indices returns the indices of the table.
-	Indices() []*column.IndexedCol
+	Indices() []Index
+
+	// WritableIndices returns write-only and public indices of the table.
+	WritableIndices() []Index
+
+	// DeletableIndices returns delete-only, write-only and public indices of the table.
+	DeletableIndices() []Index
 
 	// RecordPrefix returns the record key prefix.
 	RecordPrefix() kv.Key
@@ -60,90 +182,86 @@ type Table interface {
 	// FirstKey returns the first key.
 	FirstKey() kv.Key
 
-	// RecordKey returns the key in KV storage for the column.
-	RecordKey(h int64, col *column.Col) kv.Key
+	// RecordKey returns the key in KV storage for the row.
+	RecordKey(h kv.Handle) kv.Key
 
-	// Truncate truncates the table.
-	Truncate(ctx context.Context) (err error)
+	// AddRecord inserts a row which should contain only public columns
+	AddRecord(ctx sessionctx.Context, r []types.Datum, opts ...AddRecordOption) (recordID kv.Handle, err error)
 
-	// AddRecord inserts a row into the table.
-	AddRecord(ctx context.Context, r []interface{}) (recordID int64, err error)
-
-	// UpdateRecord updates a row in the table.
-	UpdateRecord(ctx context.Context, h int64, currData []interface{}, newData []interface{}, touched map[int]bool) error
+	// UpdateRecord updates a row which should contain only writable columns.
+	UpdateRecord(ctx context.Context, sctx sessionctx.Context, h kv.Handle, currData, newData []types.Datum, touched []bool) error
 
 	// RemoveRecord removes a row in the table.
-	RemoveRecord(ctx context.Context, h int64, r []interface{}) error
+	RemoveRecord(ctx sessionctx.Context, h kv.Handle, r []types.Datum) error
 
-	// AllocAutoID allocates an auto_increment ID for a new row.
-	AllocAutoID() (int64, error)
+	// Allocators returns all allocators.
+	Allocators(ctx sessionctx.Context) autoid.Allocators
+
+	// RebaseAutoID rebases the auto_increment ID base.
+	// If allocIDs is true, it will allocate some IDs and save to the cache.
+	// If allocIDs is false, it will not allocate IDs.
+	RebaseAutoID(ctx sessionctx.Context, newBase int64, allocIDs bool, tp autoid.AllocatorType) error
 
 	// Meta returns TableInfo.
 	Meta() *model.TableInfo
 
-	// LockRow locks a row.
-	LockRow(ctx context.Context, h int64, forRead bool) error
-
 	// Seek returns the handle greater or equal to h.
-	Seek(ctx context.Context, h int64) (handle int64, found bool, err error)
+	Seek(ctx sessionctx.Context, h kv.Handle) (handle kv.Handle, found bool, err error)
+
+	// Type returns the type of table
+	Type() Type
+}
+
+// AllocAutoIncrementValue allocates an auto_increment value for a new row.
+func AllocAutoIncrementValue(ctx context.Context, t Table, sctx sessionctx.Context) (int64, error) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("table.AllocAutoIncrementValue", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
+	}
+	increment := sctx.GetSessionVars().AutoIncrementIncrement
+	offset := sctx.GetSessionVars().AutoIncrementOffset
+	_, max, err := t.Allocators(sctx).Get(autoid.RowIDAllocType).Alloc(ctx, t.Meta().ID, uint64(1), int64(increment), int64(offset))
+	if err != nil {
+		return 0, err
+	}
+	return max, err
+}
+
+// AllocBatchAutoIncrementValue allocates batch auto_increment value for rows, returning firstID, increment and err.
+// The caller can derive the autoID by adding increment to firstID for N-1 times.
+func AllocBatchAutoIncrementValue(ctx context.Context, t Table, sctx sessionctx.Context, N int) (firstID int64, increment int64, err error) {
+	increment = int64(sctx.GetSessionVars().AutoIncrementIncrement)
+	offset := int64(sctx.GetSessionVars().AutoIncrementOffset)
+	min, max, err := t.Allocators(sctx).Get(autoid.RowIDAllocType).Alloc(ctx, t.Meta().ID, uint64(N), increment, offset)
+	if err != nil {
+		return min, max, err
+	}
+	// SeekToFirstAutoIDUnSigned seeks to first autoID. Because AutoIncrement always allocate from 1,
+	// signed and unsigned value can be unified as the unsigned handle.
+	nr := int64(autoid.SeekToFirstAutoIDUnSigned(uint64(min), uint64(increment), uint64(offset)))
+	return nr, increment, nil
+}
+
+// PhysicalTable is an abstraction for two kinds of table representation: partition or non-partitioned table.
+// PhysicalID is a ID that can be used to construct a key ranges, all the data in the key range belongs to the corresponding PhysicalTable.
+// For a non-partitioned table, its PhysicalID equals to its TableID; For a partition of a partitioned table, its PhysicalID is the partition's ID.
+type PhysicalTable interface {
+	Table
+	GetPhysicalID() int64
+}
+
+// PartitionedTable is a Table, and it has a GetPartition() method.
+// GetPartition() gets the partition from a partition table by a physical table ID,
+type PartitionedTable interface {
+	Table
+	GetPartition(physicalID int64) PhysicalTable
+	GetPartitionByRow(sessionctx.Context, []types.Datum) (PhysicalTable, error)
+	GetAllPartitionIDs() []int64
 }
 
 // TableFromMeta builds a table.Table from *model.TableInfo.
 // Currently, it is assigned to tables.TableFromMeta in tidb package's init function.
-var TableFromMeta func(alloc autoid.Allocator, tblInfo *model.TableInfo) (Table, error)
+var TableFromMeta func(allocators autoid.Allocators, tblInfo *model.TableInfo) (Table, error)
 
-// Ident is the table identifier composed of schema name and table name.
-// TODO: Move out
-type Ident struct {
-	Schema model.CIStr
-	Name   model.CIStr
-}
-
-// Full returns an Ident which set schema to the current schema if it is empty.
-func (i Ident) Full(ctx context.Context) (full Ident) {
-	full.Name = i.Name
-	full.Schema = i.Schema
-	if i.Schema.O != "" {
-		full.Schema = i.Schema
-	} else {
-		full.Schema = model.NewCIStr(db.GetCurrentSchema(ctx))
-	}
-	return
-}
-
-// String implements fmt.Stringer interface
-func (i Ident) String() string {
-	if i.Schema.O == "" {
-		return i.Name.O
-	}
-	return fmt.Sprintf("%s.%s", i.Schema, i.Name)
-}
-
-// GetColDefaultValue gets default value of the column.
-func GetColDefaultValue(ctx context.Context, col *model.ColumnInfo) (interface{}, bool, error) {
-	// Check no default value flag.
-	if mysql.HasNoDefaultValueFlag(col.Flag) && col.Tp != mysql.TypeEnum {
-		return nil, false, errors.Errorf("Field '%s' doesn't have a default value", col.Name)
-	}
-
-	// Check and get timestamp/datetime default value.
-	if col.Tp == mysql.TypeTimestamp || col.Tp == mysql.TypeDatetime {
-		if col.DefaultValue == nil {
-			return nil, true, nil
-		}
-
-		value, err := evaluator.GetTimeValue(ctx, col.DefaultValue, col.Tp, col.Decimal)
-		if err != nil {
-			return nil, true, errors.Errorf("Field '%s' get default value fail - %s", col.Name, errors.Trace(err))
-		}
-		return value, true, nil
-	} else if col.Tp == mysql.TypeEnum {
-		// For enum type, if no default value and not null is set,
-		// the default value is the first element of the enum list
-		if col.DefaultValue == nil && mysql.HasNotNullFlag(col.Flag) {
-			return col.FieldType.Elems[0], true, nil
-		}
-	}
-
-	return col.DefaultValue, true, nil
-}
+// MockTableFromMeta only serves for test.
+var MockTableFromMeta func(tableInfo *model.TableInfo) Table

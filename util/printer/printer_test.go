@@ -17,9 +17,11 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -29,6 +31,7 @@ type testPrinterSuite struct {
 }
 
 func (s *testPrinterSuite) TestPrintResult(c *C) {
+	defer testleak.AfterTest(c)()
 	cols := []string{"col1", "col2", "col3"}
 	datas := [][]string{{"11"}, {"21", "22", "23"}}
 	result, ok := GetPrintResult(cols, datas)

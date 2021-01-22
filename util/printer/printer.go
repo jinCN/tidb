@@ -15,22 +15,58 @@ package printer
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
-)
+	_ "runtime" // import link package
+	_ "unsafe"  // required by go:linkname
 
-// Version information.
-var (
-	TiDBBuildTS = "None"
-	TiDBGitHash = "None"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/util/israce"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/versioninfo"
+	"go.uber.org/zap"
 )
 
 // PrintTiDBInfo prints the TiDB version information.
 func PrintTiDBInfo() {
-	fmt.Printf("Welcome to the TiDB.\n")
-	fmt.Printf("Version:\n")
-	fmt.Printf("Git Commit Hash: %s\n", TiDBGitHash)
-	fmt.Printf("UTC Build Time:  %s\n", TiDBBuildTS)
-	fmt.Printf("\n")
+	logutil.BgLogger().Info("Welcome to TiDB.",
+		zap.String("Release Version", mysql.TiDBReleaseVersion),
+		zap.String("Edition", versioninfo.TiDBEdition),
+		zap.String("Git Commit Hash", versioninfo.TiDBGitHash),
+		zap.String("Git Branch", versioninfo.TiDBGitBranch),
+		zap.String("UTC Build Time", versioninfo.TiDBBuildTS),
+		zap.String("GoVersion", buildVersion),
+		zap.Bool("Race Enabled", israce.RaceEnabled),
+		zap.Bool("Check Table Before Drop", config.CheckTableBeforeDrop),
+		zap.String("TiKV Min Version", versioninfo.TiKVMinVersion))
+	configJSON, err := json.Marshal(config.GetGlobalConfig())
+	if err != nil {
+		panic(err)
+	}
+	logutil.BgLogger().Info("loaded config", zap.ByteString("config", configJSON))
+}
+
+// GetTiDBInfo returns the git hash and build time of this tidb-server binary.
+func GetTiDBInfo() string {
+	return fmt.Sprintf("Release Version: %s\n"+
+		"Edition: %s\n"+
+		"Git Commit Hash: %s\n"+
+		"Git Branch: %s\n"+
+		"UTC Build Time: %s\n"+
+		"GoVersion: %s\n"+
+		"Race Enabled: %v\n"+
+		"TiKV Min Version: %s\n"+
+		"Check Table Before Drop: %v",
+		mysql.TiDBReleaseVersion,
+		versioninfo.TiDBEdition,
+		versioninfo.TiDBGitHash,
+		versioninfo.TiDBGitBranch,
+		versioninfo.TiDBBuildTS,
+		buildVersion,
+		israce.RaceEnabled,
+		versioninfo.TiKVMinVersion,
+		config.CheckTableBeforeDrop)
 }
 
 // checkValidity checks whether cols and every data have the same length.
@@ -67,7 +103,7 @@ func getMaxColLen(cols []string, datas [][]string) []int {
 }
 
 func getPrintDivLine(maxColLen []int) []byte {
-	var value []byte
+	var value = make([]byte, 0)
 	for _, v := range maxColLen {
 		value = append(value, '+')
 		value = append(value, bytes.Repeat([]byte{'-'}, v+2)...)
@@ -78,7 +114,7 @@ func getPrintDivLine(maxColLen []int) []byte {
 }
 
 func getPrintCol(cols []string, maxColLen []int) []byte {
-	var value []byte
+	var value = make([]byte, 0)
 	for i, v := range cols {
 		value = append(value, '|')
 		value = append(value, ' ')
@@ -91,7 +127,7 @@ func getPrintCol(cols []string, maxColLen []int) []byte {
 }
 
 func getPrintRow(data []string, maxColLen []int) []byte {
-	var value []byte
+	var value = make([]byte, 0)
 	for i, v := range data {
 		value = append(value, '|')
 		value = append(value, ' ')
@@ -104,7 +140,7 @@ func getPrintRow(data []string, maxColLen []int) []byte {
 }
 
 func getPrintRows(datas [][]string, maxColLen []int) []byte {
-	var value []byte
+	var value = make([]byte, 0)
 	for _, data := range datas {
 		value = append(value, getPrintRow(data, maxColLen)...)
 	}
@@ -117,7 +153,7 @@ func GetPrintResult(cols []string, datas [][]string) (string, bool) {
 		return "", false
 	}
 
-	var value []byte
+	var value = make([]byte, 0)
 	maxColLen := getMaxColLen(cols, datas)
 
 	value = append(value, getPrintDivLine(maxColLen)...)
@@ -127,3 +163,6 @@ func GetPrintResult(cols []string, datas [][]string) (string, bool) {
 	value = append(value, getPrintDivLine(maxColLen)...)
 	return string(value), true
 }
+
+//go:linkname buildVersion runtime.buildVersion
+var buildVersion string

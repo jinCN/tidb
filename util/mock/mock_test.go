@@ -17,9 +17,11 @@ import (
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -37,6 +39,7 @@ func (k contextKeyType) String() string {
 const contextKey contextKeyType = 0
 
 func (s *testMockSuite) TestContext(c *C) {
+	defer testleak.AfterTest(c)()
 	ctx := NewContext()
 
 	ctx.SetValue(contextKey, 1)
@@ -46,10 +49,11 @@ func (s *testMockSuite) TestContext(c *C) {
 	ctx.ClearValue(contextKey)
 	v = ctx.Value(contextKey)
 	c.Assert(v, IsNil)
+}
 
-	_, err := ctx.GetTxn(false)
-	c.Assert(err, IsNil)
-
-	err = ctx.FinishTxn(false)
-	c.Assert(err, IsNil)
+func BenchmarkNewContext(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		NewContext()
+	}
 }

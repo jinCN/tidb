@@ -14,382 +14,452 @@
 package privileges
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"strings"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/parser/coldef"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/infoschema/perfschema"
 	"github.com/pingcap/tidb/privilege"
-	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/util/sqlexec"
+	"github.com/pingcap/tidb/sessionctx"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
-var _ privilege.Checker = (*UserPrivileges)(nil)
+// SkipWithGrant causes the server to start without using the privilege system at all.
+var SkipWithGrant = false
 
-type privileges struct {
-	Level int
-	privs map[mysql.PrivilegeType]bool
-}
+var _ privilege.Manager = (*UserPrivileges)(nil)
 
-func (ps *privileges) contain(p mysql.PrivilegeType) bool {
-	if ps.privs == nil {
-		return false
-	}
-	_, ok := ps.privs[p]
-	return ok
-}
-
-func (ps *privileges) add(p mysql.PrivilegeType) {
-	if ps.privs == nil {
-		ps.privs = make(map[mysql.PrivilegeType]bool)
-	}
-	ps.privs[p] = true
-}
-
-func (ps *privileges) String() string {
-	switch ps.Level {
-	case coldef.GrantLevelGlobal:
-		return ps.globalPrivToString()
-	case coldef.GrantLevelDB:
-		return ps.dbPrivToString()
-	case coldef.GrantLevelTable:
-		return ps.tablePrivToString()
-	}
-	return ""
-}
-
-func (ps *privileges) globalPrivToString() string {
-	if len(ps.privs) == len(mysql.AllGlobalPrivs) {
-		return mysql.AllPrivilegeLiteral
-	}
-	pstrs := make([]string, 0, len(ps.privs))
-	// Iterate AllGlobalPrivs to get stable order result.
-	for _, p := range mysql.AllGlobalPrivs {
-		_, ok := ps.privs[p]
-		if !ok {
-			continue
-		}
-		s, _ := mysql.Priv2Str[p]
-		pstrs = append(pstrs, s)
-	}
-	return strings.Join(pstrs, ",")
-}
-
-func (ps *privileges) dbPrivToString() string {
-	if len(ps.privs) == len(mysql.AllDBPrivs) {
-		return mysql.AllPrivilegeLiteral
-	}
-	pstrs := make([]string, 0, len(ps.privs))
-	// Iterate AllDBPrivs to get stable order result.
-	for _, p := range mysql.AllDBPrivs {
-		_, ok := ps.privs[p]
-		if !ok {
-			continue
-		}
-		s, _ := mysql.Priv2SetStr[p]
-		pstrs = append(pstrs, s)
-	}
-	return strings.Join(pstrs, ",")
-}
-
-func (ps *privileges) tablePrivToString() string {
-	if len(ps.privs) == len(mysql.AllTablePrivs) {
-		return mysql.AllPrivilegeLiteral
-	}
-	pstrs := make([]string, 0, len(ps.privs))
-	// Iterate AllTablePrivs to get stable order result.
-	for _, p := range mysql.AllTablePrivs {
-		_, ok := ps.privs[p]
-		if !ok {
-			continue
-		}
-		s, _ := mysql.Priv2Str[p]
-		pstrs = append(pstrs, s)
-	}
-	return strings.Join(pstrs, ",")
-}
-
-type userPrivileges struct {
-	User string
-	Host string
-	// Global privileges
-	GlobalPrivs *privileges
-	// DBName-privileges
-	DBPrivs map[string]*privileges
-	// DBName-TableName-privileges
-	TablePrivs map[string]map[string]*privileges
-}
-
-func (ps *userPrivileges) ShowGrants() []string {
-	gs := []string{}
-	// Show global grants
-	g := ps.GlobalPrivs.String()
-	if len(g) > 0 {
-		s := fmt.Sprintf(`GRANT %s ON *.* TO '%s'@'%s'`, g, ps.User, ps.Host)
-		gs = append(gs, s)
-	}
-	// Show db scope grants
-	for d, p := range ps.DBPrivs {
-		g := p.String()
-		if len(g) > 0 {
-			s := fmt.Sprintf(`GRANT %s ON %s.* TO '%s'@'%s'`, g, d, ps.User, ps.Host)
-			gs = append(gs, s)
-		}
-	}
-	// Show table scope grants
-	for d, dps := range ps.TablePrivs {
-		for t, p := range dps {
-			g := p.String()
-			if len(g) > 0 {
-				s := fmt.Sprintf(`GRANT %s ON %s.%s TO '%s'@'%s'`, g, d, t, ps.User, ps.Host)
-				gs = append(gs, s)
-			}
-		}
-	}
-	return gs
-}
-
-// UserPrivileges implements privilege.Checker interface.
+// UserPrivileges implements privilege.Manager interface.
 // This is used to check privilege for the current user.
 type UserPrivileges struct {
-	User  string
-	privs *userPrivileges
+	user string
+	host string
+	*Handle
 }
 
-// Check implements Checker.Check interface.
-func (p *UserPrivileges) Check(ctx context.Context, db *model.DBInfo, tbl *model.TableInfo, privilege mysql.PrivilegeType) (bool, error) {
-	if p.privs == nil {
-		// Lazy load
-		if len(p.User) == 0 {
-			// User current user
-			p.User = variable.GetSessionVars(ctx).User
-			if len(p.User) == 0 {
-				// In embedded db mode, user does not need to login. So we do not have username.
-				// TODO: remove this check latter.
-				return true, nil
+// RequestVerification implements the Manager interface.
+func (p *UserPrivileges) RequestVerification(activeRoles []*auth.RoleIdentity, db, table, column string, priv mysql.PrivilegeType) bool {
+	if SkipWithGrant {
+		return true
+	}
+
+	if p.user == "" && p.host == "" {
+		return true
+	}
+
+	// Skip check for system databases.
+	// See https://dev.mysql.com/doc/refman/5.7/en/information-schema.html
+	dbLowerName := strings.ToLower(db)
+	switch dbLowerName {
+	case util.InformationSchemaName.L:
+		switch priv {
+		case mysql.CreatePriv, mysql.AlterPriv, mysql.DropPriv, mysql.IndexPriv, mysql.CreateViewPriv,
+			mysql.InsertPriv, mysql.UpdatePriv, mysql.DeletePriv:
+			return false
+		}
+		return true
+	// We should be very careful of limiting privileges, so ignore `mysql` for now.
+	case util.PerformanceSchemaName.L, util.MetricSchemaName.L:
+		if (dbLowerName == util.PerformanceSchemaName.L && perfschema.IsPredefinedTable(table)) ||
+			(dbLowerName == util.MetricSchemaName.L && infoschema.IsMetricTable(table)) {
+			switch priv {
+			case mysql.CreatePriv, mysql.AlterPriv, mysql.DropPriv, mysql.IndexPriv, mysql.InsertPriv, mysql.UpdatePriv, mysql.DeletePriv:
+				return false
+			case mysql.SelectPriv:
+				return true
 			}
 		}
-		err := p.loadPrivileges(ctx)
-		if err != nil {
-			return false, errors.Trace(err)
-		}
 	}
-	// Check global scope privileges.
-	ok := p.privs.GlobalPrivs.contain(privilege)
-	if ok {
-		return true, nil
-	}
-	// Check db scope privileges.
-	dbp, ok := p.privs.DBPrivs[db.Name.O]
-	if ok {
-		ok = dbp.contain(privilege)
-		if ok {
-			return true, nil
-		}
-	}
-	if tbl == nil {
-		return false, nil
-	}
-	// Check table scope privileges.
-	dbTbl, ok := p.privs.TablePrivs[db.Name.O]
-	if !ok {
-		return false, nil
-	}
-	tblp, ok := dbTbl[tbl.Name.O]
-	if !ok {
-		return false, nil
-	}
-	return tblp.contain(privilege), nil
+
+	mysqlPriv := p.Handle.Get()
+	return mysqlPriv.RequestVerification(activeRoles, p.user, p.host, db, table, column, priv)
 }
 
-func (p *UserPrivileges) loadPrivileges(ctx context.Context) error {
-	strs := strings.Split(p.User, "@")
-	if len(strs) != 2 {
-		return errors.Errorf("Wrong username format: %s", p.User)
+// RequestVerificationWithUser implements the Manager interface.
+func (p *UserPrivileges) RequestVerificationWithUser(db, table, column string, priv mysql.PrivilegeType, user *auth.UserIdentity) bool {
+	if SkipWithGrant {
+		return true
 	}
-	username, host := strs[0], strs[1]
-	p.privs = &userPrivileges{
-		User: username,
-		Host: host,
+
+	if user == nil {
+		return false
 	}
-	// Load privileges from mysql.User/DB/Table_privs/Column_privs table
-	err := p.loadGlobalPrivileges(ctx)
-	if err != nil {
-		return errors.Trace(err)
+
+	// Skip check for INFORMATION_SCHEMA database.
+	// See https://dev.mysql.com/doc/refman/5.7/en/information-schema.html
+	if strings.EqualFold(db, "INFORMATION_SCHEMA") {
+		return true
 	}
-	err = p.loadDBScopePrivileges(ctx)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	err = p.loadTableScopePrivileges(ctx)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	// TODO: consider column scope privilege latter.
-	return nil
+
+	mysqlPriv := p.Handle.Get()
+	return mysqlPriv.RequestVerification(nil, user.Username, user.Hostname, db, table, column, priv)
 }
 
-// mysql.User/mysql.DB table privilege columns start from index 3.
-// See: booststrap.go CreateUserTable/CreateDBPrivTable
-const userTablePrivColumnStartIndex = 3
-const dbTablePrivColumnStartIndex = 3
+// GetEncodedPassword implements the Manager interface.
+func (p *UserPrivileges) GetEncodedPassword(user, host string) string {
+	mysqlPriv := p.Handle.Get()
+	record := mysqlPriv.connectionVerification(user, host)
+	if record == nil {
+		logutil.BgLogger().Error("get user privilege record fail",
+			zap.String("user", user), zap.String("host", host))
+		return ""
+	}
+	pwd := record.AuthenticationString
+	if len(pwd) != 0 && len(pwd) != mysql.PWDHashLen+1 {
+		logutil.BgLogger().Error("user password from system DB not like sha1sum", zap.String("user", user))
+		return ""
+	}
+	return pwd
+}
 
-func (p *UserPrivileges) loadGlobalPrivileges(ctx context.Context) error {
-	sql := fmt.Sprintf(`SELECT * FROM %s.%s WHERE User="%s" AND (Host="%s" OR Host="%%");`,
-		mysql.SystemDB, mysql.UserTable, p.privs.User, p.privs.Host)
-	rs, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, sql)
-	if err != nil {
-		return errors.Trace(err)
+// GetAuthWithoutVerification implements the Manager interface.
+func (p *UserPrivileges) GetAuthWithoutVerification(user, host string) (u string, h string, success bool) {
+	if SkipWithGrant {
+		p.user = user
+		p.host = host
+		success = true
+		return
 	}
-	defer rs.Close()
-	ps := &privileges{Level: coldef.GrantLevelGlobal}
-	fs, err := rs.Fields()
-	if err != nil {
-		return errors.Trace(err)
+
+	mysqlPriv := p.Handle.Get()
+	record := mysqlPriv.connectionVerification(user, host)
+	if record == nil {
+		logutil.BgLogger().Error("get user privilege record fail",
+			zap.String("user", user), zap.String("host", host))
+		return
 	}
-	for {
-		row, err := rs.Next()
-		if err != nil {
-			return errors.Trace(err)
+
+	u = record.User
+	h = record.Host
+	p.user = user
+	p.host = h
+	success = true
+	return
+}
+
+// ConnectionVerification implements the Manager interface.
+func (p *UserPrivileges) ConnectionVerification(user, host string, authentication, salt []byte, tlsState *tls.ConnectionState) (u string, h string, success bool) {
+	if SkipWithGrant {
+		p.user = user
+		p.host = host
+		success = true
+		return
+	}
+
+	mysqlPriv := p.Handle.Get()
+	record := mysqlPriv.connectionVerification(user, host)
+	if record == nil {
+		logutil.BgLogger().Error("get user privilege record fail",
+			zap.String("user", user), zap.String("host", host))
+		return
+	}
+
+	u = record.User
+	h = record.Host
+
+	globalPriv := mysqlPriv.matchGlobalPriv(user, host)
+	if globalPriv != nil {
+		if !p.checkSSL(globalPriv, tlsState) {
+			logutil.BgLogger().Error("global priv check ssl fail",
+				zap.String("user", user), zap.String("host", host))
+			success = false
+			return
 		}
-		if row == nil {
-			break
+	}
+
+	// Login a locked account is not allowed.
+	locked := record.AccountLocked
+	if locked {
+		logutil.BgLogger().Error("try to login a locked account",
+			zap.String("user", user), zap.String("host", host))
+		success = false
+		return
+	}
+
+	pwd := record.AuthenticationString
+	if len(pwd) != 0 && len(pwd) != mysql.PWDHashLen+1 {
+		logutil.BgLogger().Error("user password from system DB not like sha1sum", zap.String("user", user))
+		return
+	}
+
+	// empty password
+	if len(pwd) == 0 && len(authentication) == 0 {
+		p.user = user
+		p.host = h
+		success = true
+		return
+	}
+
+	if len(pwd) == 0 || len(authentication) == 0 {
+		return
+	}
+
+	hpwd, err := auth.DecodePassword(pwd)
+	if err != nil {
+		logutil.BgLogger().Error("decode password string failed", zap.Error(err))
+		return
+	}
+
+	if !auth.CheckScrambledPassword(salt, hpwd, authentication) {
+		return
+	}
+
+	p.user = user
+	p.host = h
+	success = true
+	return
+}
+
+type checkResult int
+
+const (
+	notCheck checkResult = iota
+	pass
+	fail
+)
+
+func (p *UserPrivileges) checkSSL(priv *globalPrivRecord, tlsState *tls.ConnectionState) bool {
+	if priv.Broken {
+		logutil.BgLogger().Info("ssl check failure, due to broken global_priv record",
+			zap.String("user", priv.User), zap.String("host", priv.Host))
+		return false
+	}
+	switch priv.Priv.SSLType {
+	case SslTypeNotSpecified, SslTypeNone:
+		return true
+	case SslTypeAny:
+		r := tlsState != nil
+		if !r {
+			logutil.BgLogger().Info("ssl check failure, require ssl but not use ssl",
+				zap.String("user", priv.User), zap.String("host", priv.Host))
 		}
-		for i := userTablePrivColumnStartIndex; i < len(fs); i++ {
-			d := row.Data[i]
-			ed, ok := d.(mysql.Enum)
-			if !ok {
-				return errors.Errorf("Privilege should be mysql.Enum: %v(%T)", d, d)
+		return r
+	case SslTypeX509:
+		if tlsState == nil {
+			logutil.BgLogger().Info("ssl check failure, require x509 but not use ssl",
+				zap.String("user", priv.User), zap.String("host", priv.Host))
+			return false
+		}
+		hasCert := false
+		for _, chain := range tlsState.VerifiedChains {
+			if len(chain) > 0 {
+				hasCert = true
+				break
 			}
-			if ed.String() != "Y" {
+		}
+		if !hasCert {
+			logutil.BgLogger().Info("ssl check failure, require x509 but no verified cert",
+				zap.String("user", priv.User), zap.String("host", priv.Host))
+		}
+		return hasCert
+	case SslTypeSpecified:
+		if tlsState == nil {
+			logutil.BgLogger().Info("ssl check failure, require subject/issuer/cipher but not use ssl",
+				zap.String("user", priv.User), zap.String("host", priv.Host))
+			return false
+		}
+		if len(priv.Priv.SSLCipher) > 0 && priv.Priv.SSLCipher != util.TLSCipher2String(tlsState.CipherSuite) {
+			logutil.BgLogger().Info("ssl check failure for cipher", zap.String("user", priv.User), zap.String("host", priv.Host),
+				zap.String("require", priv.Priv.SSLCipher), zap.String("given", util.TLSCipher2String(tlsState.CipherSuite)))
+			return false
+		}
+		var (
+			hasCert      = false
+			matchIssuer  checkResult
+			matchSubject checkResult
+			matchSAN     checkResult
+		)
+		for _, chain := range tlsState.VerifiedChains {
+			if len(chain) == 0 {
 				continue
 			}
-			f := fs[i]
-			p, ok := mysql.Col2PrivType[f.Name]
-			if !ok {
-				return errors.New("Unknown Privilege Type!")
+			cert := chain[0]
+			if len(priv.Priv.X509Issuer) > 0 {
+				given := util.X509NameOnline(cert.Issuer)
+				if priv.Priv.X509Issuer == given {
+					matchIssuer = pass
+				} else if matchIssuer == notCheck {
+					matchIssuer = fail
+					logutil.BgLogger().Info("ssl check failure for issuer", zap.String("user", priv.User), zap.String("host", priv.Host),
+						zap.String("require", priv.Priv.X509Issuer), zap.String("given", given))
+				}
 			}
-			ps.add(p)
+			if len(priv.Priv.X509Subject) > 0 {
+				given := util.X509NameOnline(cert.Subject)
+				if priv.Priv.X509Subject == given {
+					matchSubject = pass
+				} else if matchSubject == notCheck {
+					matchSubject = fail
+					logutil.BgLogger().Info("ssl check failure for subject", zap.String("user", priv.User), zap.String("host", priv.Host),
+						zap.String("require", priv.Priv.X509Subject), zap.String("given", given))
+				}
+			}
+			if len(priv.Priv.SANs) > 0 {
+				matchOne := checkCertSAN(priv, cert, priv.Priv.SANs)
+				if matchOne {
+					matchSAN = pass
+				} else if matchSAN == notCheck {
+					matchSAN = fail
+				}
+			}
+			hasCert = true
 		}
+		checkResult := hasCert && matchIssuer != fail && matchSubject != fail && matchSAN != fail
+		if !checkResult && !hasCert {
+			logutil.BgLogger().Info("ssl check failure, require issuer/subject/SAN but no verified cert",
+				zap.String("user", priv.User), zap.String("host", priv.Host))
+		}
+		return checkResult
+	default:
+		panic(fmt.Sprintf("support ssl_type: %d", priv.Priv.SSLType))
 	}
-	p.privs.GlobalPrivs = ps
-	return nil
 }
 
-func (p *UserPrivileges) loadDBScopePrivileges(ctx context.Context) error {
-	sql := fmt.Sprintf(`SELECT * FROM %s.%s WHERE User="%s" AND (Host="%s" OR Host="%%");`,
-		mysql.SystemDB, mysql.DBTable, p.privs.User, p.privs.Host)
-	rs, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, sql)
-	if err != nil {
-		return errors.Trace(err)
-	}
-	defer rs.Close()
-	ps := make(map[string]*privileges)
-	fs, err := rs.Fields()
-	if err != nil {
-		return errors.Trace(err)
-	}
-	for {
-		row, err := rs.Next()
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if row == nil {
-			break
-		}
-		// DB
-		db, ok := row.Data[1].([]byte)
-		if !ok {
-			return errors.New("This should be never happened!")
-		}
-		dbStr := string(db)
-		ps[dbStr] = &privileges{Level: coldef.GrantLevelDB}
-		for i := dbTablePrivColumnStartIndex; i < len(fs); i++ {
-			d := row.Data[i]
-			ed, ok := d.(mysql.Enum)
-			if !ok {
-				return errors.Errorf("Privilege should be mysql.Enum: %v(%T)", d, d)
+func checkCertSAN(priv *globalPrivRecord, cert *x509.Certificate, sans map[util.SANType][]string) (r bool) {
+	r = true
+	for typ, requireOr := range sans {
+		var (
+			unsupported bool
+			given       []string
+		)
+		switch typ {
+		case util.URI:
+			for _, uri := range cert.URIs {
+				given = append(given, uri.String())
 			}
-			if ed.String() != "Y" {
-				continue
+		case util.DNS:
+			given = cert.DNSNames
+		case util.IP:
+			for _, ip := range cert.IPAddresses {
+				given = append(given, ip.String())
 			}
-			f := fs[i]
-			p, ok := mysql.Col2PrivType[f.Name]
-			if !ok {
-				return errors.New("Unknown Privilege Type!")
+		default:
+			unsupported = true
+		}
+		if unsupported {
+			logutil.BgLogger().Warn("skip unsupported SAN type", zap.String("type", string(typ)),
+				zap.String("user", priv.User), zap.String("host", priv.Host))
+			continue
+		}
+		var givenMatchOne bool
+		for _, req := range requireOr {
+			for _, give := range given {
+				if req == give {
+					givenMatchOne = true
+					break
+				}
 			}
-			ps[dbStr].add(p)
+		}
+		if !givenMatchOne {
+			logutil.BgLogger().Info("ssl check failure for subject", zap.String("user", priv.User), zap.String("host", priv.Host),
+				zap.String("require", priv.Priv.SAN), zap.Strings("given", given), zap.String("type", string(typ)))
+			r = false
+			return
 		}
 	}
-	p.privs.DBPrivs = ps
-	return nil
+	return
 }
 
-func (p *UserPrivileges) loadTableScopePrivileges(ctx context.Context) error {
-	sql := fmt.Sprintf(`SELECT * FROM %s.%s WHERE User="%s" AND (Host="%s" OR Host="%%");`,
-		mysql.SystemDB, mysql.TablePrivTable, p.privs.User, p.privs.Host)
-	rs, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, sql)
-	if err != nil {
-		return errors.Trace(err)
+// DBIsVisible implements the Manager interface.
+func (p *UserPrivileges) DBIsVisible(activeRoles []*auth.RoleIdentity, db string) bool {
+	if SkipWithGrant {
+		return true
 	}
-	defer rs.Close()
-	ps := make(map[string]map[string]*privileges)
-	for {
-		row, err := rs.Next()
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if row == nil {
-			break
-		}
-		// DB
-		db, ok := row.Data[1].([]byte)
-		if !ok {
-			return errors.New("This should be never happened!")
-		}
-		dbStr := string(db)
-		// Table_name
-		tbl, ok := row.Data[3].([]byte)
-		if !ok {
-			return errors.New("This should be never happened!")
-		}
-		tblStr := string(tbl)
-		_, ok = ps[dbStr]
-		if !ok {
-			ps[dbStr] = make(map[string]*privileges)
-		}
-		ps[dbStr][tblStr] = &privileges{Level: coldef.GrantLevelTable}
-		// Table_priv
-		tblPrivs, ok := row.Data[6].(mysql.Set)
-		if !ok {
-			errors.New("This should be never happened!")
-		}
-		pvs := strings.Split(tblPrivs.Name, ",")
-		for _, d := range pvs {
-			p, ok := mysql.SetStr2Priv[d]
-			if !ok {
-				return errors.New("Unknown Privilege Type!")
-			}
-			ps[dbStr][tblStr].add(p)
+	mysqlPriv := p.Handle.Get()
+	if mysqlPriv.DBIsVisible(p.user, p.host, db) {
+		return true
+	}
+	allRoles := mysqlPriv.FindAllRole(activeRoles)
+	for _, role := range allRoles {
+		if mysqlPriv.DBIsVisible(role.Username, role.Hostname, db) {
+			return true
 		}
 	}
-	p.privs.TablePrivs = ps
-	return nil
+	return false
 }
 
-// ShowGrants implements privilege.Checker ShowGrants interface.
-func (p *UserPrivileges) ShowGrants(ctx context.Context, user string) ([]string, error) {
-	// If user is current user
-	if user == p.User {
-		return p.privs.ShowGrants(), nil
+// UserPrivilegesTable implements the Manager interface.
+func (p *UserPrivileges) UserPrivilegesTable() [][]types.Datum {
+	mysqlPriv := p.Handle.Get()
+	return mysqlPriv.UserPrivilegesTable()
+}
+
+// ShowGrants implements privilege.Manager ShowGrants interface.
+func (p *UserPrivileges) ShowGrants(ctx sessionctx.Context, user *auth.UserIdentity, roles []*auth.RoleIdentity) (grants []string, err error) {
+	if SkipWithGrant {
+		return nil, ErrNonexistingGrant.GenWithStackByArgs("root", "%")
 	}
-	userp := &UserPrivileges{User: user}
-	err := userp.loadPrivileges(ctx)
-	if err != nil {
-		return nil, errors.Trace(err)
+	mysqlPrivilege := p.Handle.Get()
+	u := user.Username
+	h := user.Hostname
+	if len(user.AuthUsername) > 0 && len(user.AuthHostname) > 0 {
+		u = user.AuthUsername
+		h = user.AuthHostname
 	}
-	return userp.privs.ShowGrants(), nil
+	grants = mysqlPrivilege.showGrants(u, h, roles)
+	if len(grants) == 0 {
+		err = ErrNonexistingGrant.GenWithStackByArgs(u, h)
+	}
+
+	return
+}
+
+// ActiveRoles implements privilege.Manager ActiveRoles interface.
+func (p *UserPrivileges) ActiveRoles(ctx sessionctx.Context, roleList []*auth.RoleIdentity) (bool, string) {
+	if SkipWithGrant {
+		return true, ""
+	}
+	mysqlPrivilege := p.Handle.Get()
+	u := p.user
+	h := p.host
+	for _, r := range roleList {
+		ok := mysqlPrivilege.FindRole(u, h, r)
+		if !ok {
+			logutil.BgLogger().Error("find role failed", zap.Stringer("role", r))
+			return false, r.String()
+		}
+	}
+	ctx.GetSessionVars().ActiveRoles = roleList
+	return true, ""
+}
+
+// FindEdge implements privilege.Manager FindRelationship interface.
+func (p *UserPrivileges) FindEdge(ctx sessionctx.Context, role *auth.RoleIdentity, user *auth.UserIdentity) bool {
+	if SkipWithGrant {
+		return false
+	}
+	mysqlPrivilege := p.Handle.Get()
+	ok := mysqlPrivilege.FindRole(user.Username, user.Hostname, role)
+	if !ok {
+		logutil.BgLogger().Error("find role failed", zap.Stringer("role", role))
+		return false
+	}
+	return true
+}
+
+// GetDefaultRoles returns all default roles for certain user.
+func (p *UserPrivileges) GetDefaultRoles(user, host string) []*auth.RoleIdentity {
+	if SkipWithGrant {
+		return make([]*auth.RoleIdentity, 0, 10)
+	}
+	mysqlPrivilege := p.Handle.Get()
+	ret := mysqlPrivilege.getDefaultRoles(user, host)
+	return ret
+}
+
+// GetAllRoles return all roles of user.
+func (p *UserPrivileges) GetAllRoles(user, host string) []*auth.RoleIdentity {
+	if SkipWithGrant {
+		return make([]*auth.RoleIdentity, 0, 10)
+	}
+
+	mysqlPrivilege := p.Handle.Get()
+	return mysqlPrivilege.getAllRoles(user, host)
 }

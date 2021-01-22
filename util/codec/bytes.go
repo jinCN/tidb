@@ -14,12 +14,11 @@
 package codec
 
 import (
-	"bytes"
 	"encoding/binary"
 	"runtime"
 	"unsafe"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 )
 
 const (
@@ -29,8 +28,7 @@ const (
 )
 
 var (
-	pads    = make([]byte, encGroupSize)
-	encPads = []byte{encPad}
+	pads = make([]byte, encGroupSize)
 )
 
 // EncodeBytes guarantees the encoded value is in ascending order for comparison,
@@ -69,48 +67,67 @@ func EncodeBytes(b []byte, data []byte) []byte {
 	return result
 }
 
-func decodeBytes(b []byte, reverse bool) ([]byte, []byte, error) {
-	data := make([]byte, 0, len(b))
+// EncodedBytesLength returns the length of data after encoded
+func EncodedBytesLength(dataLen int) int {
+	mod := dataLen % encGroupSize
+	padCount := encGroupSize - mod
+	return dataLen + padCount + 1 + dataLen/encGroupSize
+}
+
+func decodeBytes(b []byte, buf []byte, reverse bool) ([]byte, []byte, error) {
+	if buf == nil {
+		buf = make([]byte, 0, len(b))
+	}
+	buf = buf[:0]
 	for {
 		if len(b) < encGroupSize+1 {
 			return nil, nil, errors.New("insufficient bytes to decode value")
 		}
 
 		groupBytes := b[:encGroupSize+1]
-		if reverse {
-			reverseBytes(groupBytes)
-		}
 
 		group := groupBytes[:encGroupSize]
 		marker := groupBytes[encGroupSize]
 
-		// Check validity of marker.
-		padCount := encMarker - marker
-		realGroupSize := encGroupSize - padCount
+		var padCount byte
+		if reverse {
+			padCount = marker
+		} else {
+			padCount = encMarker - marker
+		}
 		if padCount > encGroupSize {
 			return nil, nil, errors.Errorf("invalid marker byte, group bytes %q", groupBytes)
 		}
 
-		data = append(data, group[:realGroupSize]...)
+		realGroupSize := encGroupSize - padCount
+		buf = append(buf, group[:realGroupSize]...)
 		b = b[encGroupSize+1:]
 
-		if marker != encMarker {
-			// Check validity of padding bytes.
-			if bytes.Count(group[realGroupSize:], encPads) != int(padCount) {
-				return nil, nil, errors.Errorf("invalid padding byte, group bytes %q", groupBytes)
+		if padCount != 0 {
+			var padByte = encPad
+			if reverse {
+				padByte = encMarker
 			}
-
+			// Check validity of padding bytes.
+			for _, v := range group[realGroupSize:] {
+				if v != padByte {
+					return nil, nil, errors.Errorf("invalid padding byte, group bytes %q", groupBytes)
+				}
+			}
 			break
 		}
 	}
-
-	return b, data, nil
+	if reverse {
+		reverseBytes(buf)
+	}
+	return b, buf, nil
 }
 
 // DecodeBytes decodes bytes which is encoded by EncodeBytes before,
 // returns the leftover bytes and decoded value if no error.
-func DecodeBytes(b []byte) ([]byte, []byte, error) {
-	return decodeBytes(b, false)
+// `buf` is used to buffer data to avoid the cost of makeslice in decodeBytes when DecodeBytes is called by Decoder.DecodeOne.
+func DecodeBytes(b []byte, buf []byte) ([]byte, []byte, error) {
+	return decodeBytes(b, buf, false)
 }
 
 // EncodeBytesDesc first encodes bytes using EncodeBytes, then bitwise reverses
@@ -124,8 +141,8 @@ func EncodeBytesDesc(b []byte, data []byte) []byte {
 
 // DecodeBytesDesc decodes bytes which is encoded by EncodeBytesDesc before,
 // returns the leftover bytes and decoded value if no error.
-func DecodeBytesDesc(b []byte) ([]byte, []byte, error) {
-	return decodeBytes(b, true)
+func DecodeBytesDesc(b []byte, buf []byte) ([]byte, []byte, error) {
+	return decodeBytes(b, buf, true)
 }
 
 // EncodeCompactBytes joins bytes with its length into a byte slice. It is more
@@ -183,7 +200,7 @@ func reverseBytes(b []byte) {
 	safeReverseBytes(b)
 }
 
-// like realloc.
+// reallocBytes is like realloc.
 func reallocBytes(b []byte, n int) []byte {
 	newSize := len(b) + n
 	if cap(b) < newSize {

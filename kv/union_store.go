@@ -14,26 +14,47 @@
 package kv
 
 import (
-	"bytes"
+	"context"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/parser/model"
 )
 
-// UnionStore is a store that wraps a snapshot for read and a BufferStore for buffered write.
+// UnionStore is a store that wraps a snapshot for read and a MemBuffer for buffered write.
 // Also, it provides some transaction related utilities.
 type UnionStore interface {
-	MemBuffer
-	// CheckLazyConditionPairs loads all lazy values from store then checks if all values are matched.
-	// Lazy condition pairs should be checked before transaction commit.
-	CheckLazyConditionPairs() error
-	// WalkBuffer iterates all buffered kv pairs.
-	WalkBuffer(f func(k Key, v []byte) error) error
+	Retriever
+
+	// HasPresumeKeyNotExists returns whether the key presumed key not exists error for the lazy check.
+	HasPresumeKeyNotExists(k Key) bool
+	// UnmarkPresumeKeyNotExists deletes the key presume key not exists error flag for the lazy check.
+	UnmarkPresumeKeyNotExists(k Key)
+	// CacheIndexName caches the index name.
+	// PresumeKeyNotExists will use this to help decode error message.
+	CacheTableInfo(id int64, info *model.TableInfo)
+	// GetIndexName returns the cached index name.
+	// If there is no such index already inserted through CacheIndexName, it will return UNKNOWN.
+	GetTableInfo(id int64) *model.TableInfo
+
 	// SetOption sets an option with a value, when val is nil, uses the default
 	// value of this option.
 	SetOption(opt Option, val interface{})
 	// DelOption deletes an option.
 	DelOption(opt Option)
+	// GetOption gets an option.
+	GetOption(opt Option) interface{}
+	// GetMemBuffer return the MemBuffer binding to this unionStore.
+	GetMemBuffer() MemBuffer
 }
+
+// AssertionType is the type of a assertion.
+type AssertionType int
+
+// The AssertionType constants.
+const (
+	None AssertionType = iota
+	Exist
+	NotExist
+)
 
 // Option is used for customizing kv store's behaviors during a transaction.
 type Option int
@@ -44,164 +65,106 @@ type Options interface {
 	Get(opt Option) (v interface{}, ok bool)
 }
 
-var (
-	p = newCache("memdb pool", 100, func() MemBuffer {
-		return NewMemDbBuffer()
-	})
-)
-
-// conditionPair is used to store lazy check condition.
-// If condition not match (value is not equal as expected one), returns err.
-type conditionPair struct {
-	key   Key
-	value []byte
-	err   error
-}
-
-// UnionStore is an in-memory Store which contains a buffer for write and a
+// unionStore is an in-memory Store which contains a buffer for write and a
 // snapshot for read.
 type unionStore struct {
-	*BufferStore
-	snapshot           Snapshot                    // for read
-	lazyConditionPairs map[string](*conditionPair) // for delay check
-	opts               options
+	memBuffer    *memdb
+	snapshot     Snapshot
+	idxNameCache map[int64]*model.TableInfo
+	opts         options
 }
 
-// NewUnionStore builds a new UnionStore.
+// NewUnionStore builds a new unionStore.
 func NewUnionStore(snapshot Snapshot) UnionStore {
 	return &unionStore{
-		BufferStore:        NewBufferStore(snapshot),
-		snapshot:           snapshot,
-		lazyConditionPairs: make(map[string](*conditionPair)),
-		opts:               make(map[Option]interface{}),
+		snapshot:     snapshot,
+		memBuffer:    newMemDB(),
+		idxNameCache: make(map[int64]*model.TableInfo),
+		opts:         make(map[Option]interface{}),
 	}
 }
 
-type lazyMemBuffer struct {
-	mb MemBuffer
-}
-
-func (lmb *lazyMemBuffer) Get(k Key) ([]byte, error) {
-	if lmb.mb == nil {
-		return nil, ErrNotExist
-	}
-
-	return lmb.mb.Get(k)
-}
-
-func (lmb *lazyMemBuffer) Set(key Key, value []byte) error {
-	if lmb.mb == nil {
-		lmb.mb = p.get()
-	}
-
-	return lmb.mb.Set(key, value)
-}
-
-func (lmb *lazyMemBuffer) Delete(k Key) error {
-	if lmb.mb == nil {
-		lmb.mb = p.get()
-	}
-
-	return lmb.mb.Delete(k)
-}
-
-func (lmb *lazyMemBuffer) Seek(k Key) (Iterator, error) {
-	if lmb.mb == nil {
-		lmb.mb = p.get()
-	}
-
-	return lmb.mb.Seek(k)
-}
-
-func (lmb *lazyMemBuffer) Release() {
-	if lmb.mb == nil {
-		return
-	}
-
-	lmb.mb.Release()
-
-	p.put(lmb.mb)
-	lmb.mb = nil
+// GetMemBuffer return the MemBuffer binding to this unionStore.
+func (us *unionStore) GetMemBuffer() MemBuffer {
+	return us.memBuffer
 }
 
 // Get implements the Retriever interface.
-func (us *unionStore) Get(k Key) ([]byte, error) {
-	v, err := us.MemBuffer.Get(k)
+func (us *unionStore) Get(ctx context.Context, k Key) ([]byte, error) {
+	v, err := us.memBuffer.Get(ctx, k)
 	if IsErrNotFound(err) {
-		if _, ok := us.opts.Get(PresumeKeyNotExists); ok {
-			e, ok := us.opts.Get(PresumeKeyNotExistsError)
-			if ok && e != nil {
-				us.markLazyConditionPair(k, nil, e.(error))
-			} else {
-				us.markLazyConditionPair(k, nil, ErrKeyExists)
-			}
-			return nil, errors.Trace(ErrNotExist)
-		}
-	}
-	if IsErrNotFound(err) {
-		v, err = us.BufferStore.r.Get(k)
+		v, err = us.snapshot.Get(ctx, k)
 	}
 	if err != nil {
-		return v, errors.Trace(err)
+		return v, err
 	}
 	if len(v) == 0 {
-		return nil, errors.Trace(ErrNotExist)
+		return nil, ErrNotExist
 	}
 	return v, nil
 }
 
-// markLazyConditionPair marks a kv pair for later check.
-// If condition not match, should return e as error.
-func (us *unionStore) markLazyConditionPair(k Key, v []byte, e error) {
-	us.lazyConditionPairs[string(k)] = &conditionPair{
-		key:   k.Clone(),
-		value: v,
-		err:   e,
-	}
-}
-
-// CheckLazyConditionPairs implements the UnionStore interface.
-func (us *unionStore) CheckLazyConditionPairs() error {
-	if len(us.lazyConditionPairs) == 0 {
-		return nil
-	}
-	keys := make([]Key, 0, len(us.lazyConditionPairs))
-	for _, v := range us.lazyConditionPairs {
-		keys = append(keys, v.key)
-	}
-	values, err := us.snapshot.BatchGet(keys)
+// Iter implements the Retriever interface.
+func (us *unionStore) Iter(k Key, upperBound Key) (Iterator, error) {
+	bufferIt, err := us.memBuffer.Iter(k, upperBound)
 	if err != nil {
-		return errors.Trace(err)
+		return nil, err
 	}
-
-	for k, v := range us.lazyConditionPairs {
-		if len(v.value) == 0 {
-			if _, exist := values[k]; exist {
-				return errors.Trace(v.err)
-			}
-		} else {
-			if bytes.Compare(values[k], v.value) != 0 {
-				return errors.Trace(ErrLazyConditionPairsNotMatch)
-			}
-		}
+	retrieverIt, err := us.snapshot.Iter(k, upperBound)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return NewUnionIter(bufferIt, retrieverIt, false)
 }
 
-// SetOption implements the UnionStore SetOption interface.
+// IterReverse implements the Retriever interface.
+func (us *unionStore) IterReverse(k Key) (Iterator, error) {
+	bufferIt, err := us.memBuffer.IterReverse(k)
+	if err != nil {
+		return nil, err
+	}
+	retrieverIt, err := us.snapshot.IterReverse(k)
+	if err != nil {
+		return nil, err
+	}
+	return NewUnionIter(bufferIt, retrieverIt, true)
+}
+
+// HasPresumeKeyNotExists gets the key exist error info for the lazy check.
+func (us *unionStore) HasPresumeKeyNotExists(k Key) bool {
+	flags, err := us.memBuffer.GetFlags(k)
+	if err != nil {
+		return false
+	}
+	return flags.HasPresumeKeyNotExists()
+}
+
+// DeleteKeyExistErrInfo deletes the key exist error info for the lazy check.
+func (us *unionStore) UnmarkPresumeKeyNotExists(k Key) {
+	us.memBuffer.UpdateFlags(k, DelPresumeKeyNotExists)
+}
+
+func (us *unionStore) GetTableInfo(id int64) *model.TableInfo {
+	return us.idxNameCache[id]
+}
+
+func (us *unionStore) CacheTableInfo(id int64, info *model.TableInfo) {
+	us.idxNameCache[id] = info
+}
+
+// SetOption implements the unionStore SetOption interface.
 func (us *unionStore) SetOption(opt Option, val interface{}) {
 	us.opts[opt] = val
 }
 
-// DelOption implements the UnionStore DelOption interface.
+// DelOption implements the unionStore DelOption interface.
 func (us *unionStore) DelOption(opt Option) {
 	delete(us.opts, opt)
 }
 
-// Release implements the UnionStore Release interface.
-func (us *unionStore) Release() {
-	us.snapshot.Release()
-	us.BufferStore.Release()
+// GetOption implements the unionStore GetOption interface.
+func (us *unionStore) GetOption(opt Option) interface{} {
+	return us.opts[opt]
 }
 
 type options map[Option]interface{}

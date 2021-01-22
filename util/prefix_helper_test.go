@@ -11,16 +11,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package util
+package util_test
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
+	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 const (
@@ -30,6 +33,7 @@ const (
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -40,22 +44,17 @@ type testPrefixSuite struct {
 }
 
 func (s *testPrefixSuite) SetUpSuite(c *C) {
-	path := "memory:"
-	d := localstore.Driver{
-		Driver: goleveldb.MemoryDriver{},
-	}
-	store, err := d.Open(path)
+	testleak.BeforeTest()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	s.s = store
 
-	// must in cache
-	cacheS, _ := d.Open(path)
-	c.Assert(cacheS, Equals, store)
 }
 
 func (s *testPrefixSuite) TearDownSuite(c *C) {
 	err := s.s.Close()
 	c.Assert(err, IsNil)
+	testleak.AfterTest(c)()
 }
 
 func encodeInt(n int) []byte {
@@ -109,12 +108,11 @@ func (c *MockContext) fillTxn() error {
 	return nil
 }
 
-func (c *MockContext) FinishTxn(rollback bool) error {
+func (c *MockContext) CommitTxn() error {
 	if c.txn == nil {
 		return nil
 	}
-
-	return c.txn.Commit()
+	return c.txn.Commit(context.Background())
 }
 
 func (s *testPrefixSuite) TestPrefix(c *C) {
@@ -122,29 +120,38 @@ func (s *testPrefixSuite) TestPrefix(c *C) {
 	ctx.fillTxn()
 	txn, err := ctx.GetTxn(false)
 	c.Assert(err, IsNil)
-	err = DelKeyWithPrefix(txn, encodeInt(ctx.prefix))
+	err = util.DelKeyWithPrefix(txn, encodeInt(ctx.prefix))
 	c.Assert(err, IsNil)
-	err = ctx.FinishTxn(false)
+	err = ctx.CommitTxn()
 	c.Assert(err, IsNil)
 
 	txn, err = s.s.Begin()
 	c.Assert(err, IsNil)
 	k := []byte("key100jfowi878230")
-	err = txn.Set(k, []byte("val32dfaskli384757^*&%^"))
+	err = txn.Set(k, []byte(`val32dfaskli384757^*&%^`))
 	c.Assert(err, IsNil)
-	err = ScanMetaWithPrefix(txn, k, func(kv.Key, []byte) bool {
+	err = util.ScanMetaWithPrefix(txn, k, func(kv.Key, []byte) bool {
 		return true
 	})
 	c.Assert(err, IsNil)
-	err = txn.Commit()
+	err = util.ScanMetaWithPrefix(txn, k, func(kv.Key, []byte) bool {
+		return false
+	})
+	c.Assert(err, IsNil)
+	err = util.DelKeyWithPrefix(txn, []byte("key"))
+	c.Assert(err, IsNil)
+	_, err = txn.Get(context.TODO(), k)
+	c.Assert(terror.ErrorEqual(kv.ErrNotExist, err), IsTrue)
+
+	err = txn.Commit(context.Background())
 	c.Assert(err, IsNil)
 }
 
 func (s *testPrefixSuite) TestPrefixFilter(c *C) {
-	rowKey := []byte("test@#$%l(le[0]..prefix) 2uio")
+	rowKey := []byte(`test@#$%l(le[0]..prefix) 2uio`)
 	rowKey[8] = 0x00
 	rowKey[9] = 0x00
-	f := RowKeyPrefixFilter(rowKey)
+	f := util.RowKeyPrefixFilter(rowKey)
 	b := f(append(rowKey, []byte("akjdf3*(34")...))
 	c.Assert(b, IsFalse)
 	buf := f([]byte("sjfkdlsaf"))

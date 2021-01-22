@@ -14,9 +14,10 @@
 package kv
 
 import (
-	"github.com/juju/errors"
+	"context"
+
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 var _ = Suite(&testUnionStoreSuite{})
@@ -27,77 +28,100 @@ type testUnionStoreSuite struct {
 }
 
 func (s *testUnionStoreSuite) SetUpTest(c *C) {
-	s.store = NewMemDbBuffer()
+	s.store = newMemDB()
 	s.us = NewUnionStore(&mockSnapshot{s.store})
 }
 
-func (s *testUnionStoreSuite) TearDownTest(c *C) {
-	s.us.Release()
-}
-
 func (s *testUnionStoreSuite) TestGetSet(c *C) {
-	s.store.Set([]byte("1"), []byte("1"))
-	v, err := s.us.Get([]byte("1"))
+	defer testleak.AfterTest(c)()
+	err := s.store.Set([]byte("1"), []byte("1"))
+	c.Assert(err, IsNil)
+	v, err := s.us.Get(context.TODO(), []byte("1"))
 	c.Assert(err, IsNil)
 	c.Assert(v, BytesEquals, []byte("1"))
-	s.us.Set([]byte("1"), []byte("2"))
-	v, err = s.us.Get([]byte("1"))
+	err = s.us.GetMemBuffer().Set([]byte("1"), []byte("2"))
+	c.Assert(err, IsNil)
+	v, err = s.us.Get(context.TODO(), []byte("1"))
 	c.Assert(err, IsNil)
 	c.Assert(v, BytesEquals, []byte("2"))
+	c.Assert(s.us.GetMemBuffer().Size(), Equals, 2)
+	c.Assert(s.us.GetMemBuffer().Len(), Equals, 1)
 }
 
 func (s *testUnionStoreSuite) TestDelete(c *C) {
-	s.store.Set([]byte("1"), []byte("1"))
-	err := s.us.Delete([]byte("1"))
+	defer testleak.AfterTest(c)()
+	err := s.store.Set([]byte("1"), []byte("1"))
 	c.Assert(err, IsNil)
-	_, err = s.us.Get([]byte("1"))
+	err = s.us.GetMemBuffer().Delete([]byte("1"))
+	c.Assert(err, IsNil)
+	_, err = s.us.Get(context.TODO(), []byte("1"))
 	c.Assert(IsErrNotFound(err), IsTrue)
 
-	s.us.Set([]byte("1"), []byte("2"))
-	v, err := s.us.Get([]byte("1"))
+	err = s.us.GetMemBuffer().Set([]byte("1"), []byte("2"))
+	c.Assert(err, IsNil)
+	v, err := s.us.Get(context.TODO(), []byte("1"))
 	c.Assert(err, IsNil)
 	c.Assert(v, BytesEquals, []byte("2"))
 }
 
 func (s *testUnionStoreSuite) TestSeek(c *C) {
-	s.store.Set([]byte("1"), []byte("1"))
-	s.store.Set([]byte("2"), []byte("2"))
-	s.store.Set([]byte("3"), []byte("3"))
+	defer testleak.AfterTest(c)()
+	err := s.store.Set([]byte("1"), []byte("1"))
+	c.Assert(err, IsNil)
+	err = s.store.Set([]byte("2"), []byte("2"))
+	c.Assert(err, IsNil)
+	err = s.store.Set([]byte("3"), []byte("3"))
+	c.Assert(err, IsNil)
 
-	iter, err := s.us.Seek(nil)
+	iter, err := s.us.Iter(nil, nil)
 	c.Assert(err, IsNil)
 	checkIterator(c, iter, [][]byte{[]byte("1"), []byte("2"), []byte("3")}, [][]byte{[]byte("1"), []byte("2"), []byte("3")})
 
-	iter, err = s.us.Seek([]byte("2"))
+	iter, err = s.us.Iter([]byte("2"), nil)
 	c.Assert(err, IsNil)
 	checkIterator(c, iter, [][]byte{[]byte("2"), []byte("3")}, [][]byte{[]byte("2"), []byte("3")})
 
-	s.us.Set([]byte("4"), []byte("4"))
-	iter, err = s.us.Seek([]byte("2"))
+	err = s.us.GetMemBuffer().Set([]byte("4"), []byte("4"))
+	c.Assert(err, IsNil)
+	iter, err = s.us.Iter([]byte("2"), nil)
 	c.Assert(err, IsNil)
 	checkIterator(c, iter, [][]byte{[]byte("2"), []byte("3"), []byte("4")}, [][]byte{[]byte("2"), []byte("3"), []byte("4")})
 
-	s.us.Delete([]byte("3"))
-	iter, err = s.us.Seek([]byte("2"))
+	err = s.us.GetMemBuffer().Delete([]byte("3"))
+	c.Assert(err, IsNil)
+	iter, err = s.us.Iter([]byte("2"), nil)
 	c.Assert(err, IsNil)
 	checkIterator(c, iter, [][]byte{[]byte("2"), []byte("4")}, [][]byte{[]byte("2"), []byte("4")})
 }
 
-func (s *testUnionStoreSuite) TestLazyConditionCheck(c *C) {
-	s.store.Set([]byte("1"), []byte("1"))
-	s.store.Set([]byte("2"), []byte("2"))
-
-	v, err := s.us.Get([]byte("1"))
+func (s *testUnionStoreSuite) TestIterReverse(c *C) {
+	defer testleak.AfterTest(c)()
+	err := s.store.Set([]byte("1"), []byte("1"))
 	c.Assert(err, IsNil)
-	c.Assert(v, BytesEquals, []byte("1"))
+	err = s.store.Set([]byte("2"), []byte("2"))
+	c.Assert(err, IsNil)
+	err = s.store.Set([]byte("3"), []byte("3"))
+	c.Assert(err, IsNil)
 
-	s.us.SetOption(PresumeKeyNotExists, nil)
-	s.us.SetOption(PresumeKeyNotExistsError, ErrNotExist)
-	_, err = s.us.Get([]byte("2"))
-	c.Assert(terror.ErrorEqual(err, ErrNotExist), IsTrue)
+	iter, err := s.us.IterReverse(nil)
+	c.Assert(err, IsNil)
+	checkIterator(c, iter, [][]byte{[]byte("3"), []byte("2"), []byte("1")}, [][]byte{[]byte("3"), []byte("2"), []byte("1")})
 
-	err = s.us.CheckLazyConditionPairs()
-	c.Assert(err, NotNil)
+	iter, err = s.us.IterReverse([]byte("3"))
+	c.Assert(err, IsNil)
+	checkIterator(c, iter, [][]byte{[]byte("2"), []byte("1")}, [][]byte{[]byte("2"), []byte("1")})
+
+	err = s.us.GetMemBuffer().Set([]byte("0"), []byte("0"))
+	c.Assert(err, IsNil)
+	iter, err = s.us.IterReverse([]byte("3"))
+	c.Assert(err, IsNil)
+	checkIterator(c, iter, [][]byte{[]byte("2"), []byte("1"), []byte("0")}, [][]byte{[]byte("2"), []byte("1"), []byte("0")})
+
+	err = s.us.GetMemBuffer().Delete([]byte("1"))
+	c.Assert(err, IsNil)
+	iter, err = s.us.IterReverse([]byte("3"))
+	c.Assert(err, IsNil)
+	checkIterator(c, iter, [][]byte{[]byte("2"), []byte("0")}, [][]byte{[]byte("2"), []byte("0")})
 }
 
 func checkIterator(c *C, iter Iterator, keys [][]byte, values [][]byte) {
@@ -111,35 +135,4 @@ func checkIterator(c *C, iter Iterator, keys [][]byte, values [][]byte) {
 		c.Assert(iter.Next(), IsNil)
 	}
 	c.Assert(iter.Valid(), IsFalse)
-}
-
-type mockSnapshot struct {
-	store MemBuffer
-}
-
-func (s *mockSnapshot) Get(k Key) ([]byte, error) {
-	return s.store.Get(k)
-}
-
-func (s *mockSnapshot) BatchGet(keys []Key) (map[string][]byte, error) {
-	m := make(map[string][]byte)
-	for _, k := range keys {
-		v, err := s.store.Get(k)
-		if IsErrNotFound(err) {
-			continue
-		}
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-		m[string(k)] = v
-	}
-	return m, nil
-}
-
-func (s *mockSnapshot) Seek(k Key) (Iterator, error) {
-	return s.store.Seek(k)
-}
-
-func (s *mockSnapshot) Release() {
-	s.store.Release()
 }

@@ -13,16 +13,40 @@
 
 package ddl
 
-import "github.com/pingcap/tidb/model"
+import (
+	"context"
 
-// Callback is the interface supporting callback function when DDL changed.
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/tidb/sessionctx"
+)
+
+// Interceptor is used for DDL.
+type Interceptor interface {
+	// OnGetInfoSchema is an intercept which is called in the function ddl.GetInfoSchema(). It is used in the tests.
+	OnGetInfoSchema(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema
+}
+
+// BaseInterceptor implements Interceptor.
+type BaseInterceptor struct{}
+
+// OnGetInfoSchema implements Interceptor.OnGetInfoSchema interface.
+func (bi *BaseInterceptor) OnGetInfoSchema(ctx sessionctx.Context, is infoschema.InfoSchema) infoschema.InfoSchema {
+	return is
+}
+
+// Callback is used for DDL.
 type Callback interface {
-	// OnChanged is called after schema is changed.
+	// OnChanged is called after a ddl statement is finished.
 	OnChanged(err error) error
+	// OnSchemaStateChange is called after a schema state is changed.
+	OnSchemaStateChanged()
 	// OnJobRunBefore is called before running job.
 	OnJobRunBefore(job *model.Job)
 	// OnJobUpdated is called after the running job is updated.
 	OnJobUpdated(job *model.Job)
+	// OnWatched is called after watching owner is completed.
+	OnWatched(ctx context.Context)
 }
 
 // BaseCallback implements Callback.OnChanged interface.
@@ -34,6 +58,11 @@ func (c *BaseCallback) OnChanged(err error) error {
 	return err
 }
 
+// OnSchemaStateChanged implements Callback interface.
+func (c *BaseCallback) OnSchemaStateChanged() {
+	// Nothing to do.
+}
+
 // OnJobRunBefore implements Callback.OnJobRunBefore interface.
 func (c *BaseCallback) OnJobRunBefore(job *model.Job) {
 	// Nothing to do.
@@ -41,5 +70,10 @@ func (c *BaseCallback) OnJobRunBefore(job *model.Job) {
 
 // OnJobUpdated implements Callback.OnJobUpdated interface.
 func (c *BaseCallback) OnJobUpdated(job *model.Job) {
+	// Nothing to do.
+}
+
+// OnWatched implements Callback.OnWatched interface.
+func (c *BaseCallback) OnWatched(ctx context.Context) {
 	// Nothing to do.
 }

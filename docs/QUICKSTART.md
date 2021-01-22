@@ -1,13 +1,10 @@
 # Quick Start
 
-#### Run TiDB with docker
+#### Run TiDB with Docker (Standalone mode)
 
-You can quickly test TiDB with docker, the source repository contains the Dockerfile which
-contains local tidb-server.
+You can quickly test TiDB with Docker, the source repository contains the Dockerfile which contains local tidb-server.
 
-Or you can pull TiDB docker image contains HBase standalone and then run TiDB as a distributed database in a docker container.
-
-To install docker on your system, you can read the document on https://docs.docker.com/
+To install Docker on your system, you can read the document on https://docs.docker.com/
 
 ```
 docker pull pingcap/tidb:latest
@@ -19,43 +16,29 @@ docker run --name tidb-server -d -p 4000:4000 pingcap/tidb:latest
 Then you can use official mysql client to connect to TiDB.
 
 ```
-mysql -h 127.0.0.1 -P 4000 -u root -D test
+mysql -h 127.0.0.1 -P 4000 -u root -D test --prompt="tidb> "  
 ```
 
-Notice: OSX user may use `docker-machine ip` to connect it.
+Notice: OS X user may use `docker-machine ip` to connect it.
 
-#### __Run TiDB on HBase__
+#### __Or run TiDB on TiKV cluster__ 
 
-Read this [doc](https://github.com/pingcap/tidb/blob/master/docs/HBASE_QUICKSTART.md).
+Read the documents for [Ansible deployment](https://pingcap.com/docs/stable/how-to/deploy/orchestrated/ansible/) or [Docker deployment](https://pingcap.com/docs/stable/how-to/deploy/orchestrated/docker/).
 
 #### __Pre-requirement__
 
-Go environment. Currently a 64-bit version of go >= 1.5 is required.
+Go environment. Currently a 64-bit version of go >= 1.9 is required.
 ```
 git clone https://github.com/pingcap/tidb.git $GOPATH/src/github.com/pingcap/tidb
 cd $GOPATH/src/github.com/pingcap/tidb
 make
 ```
 
-#### __Run command line interpreter__
-
-Interpreter is an interactive command line TiDB client.
-You can just enter some SQL statements and get the result.
-```
-make interpreter
-cd interpreter && ./interpreter
-```
-Press `Ctrl+C` to quit.
-
-#### __Run as go library__
-
-See [USAGE.md](./USAGE.md) for detailed instructions to use TiDB as library in Go code.
-
 #### __Run as MySQL protocol server__
 
 ```
-make server
-cd tidb-server && ./tidb-server
+make
+cd bin && ./tidb-server
 ```
 
 In case you want to compile a specific location:
@@ -68,8 +51,8 @@ The default server port is `4000` and can be changed by flag `-P <port>`.
 
 Run `./tidb-server -h` to see more flag options.
 
-After you started tidb-server, you can use official mysql client to connect to TiDB.
+After you started tidb-server, you can use official `mysql` client to connect to TiDB.
 
 ```
-mysql -h 127.0.0.1 -P 4000 -u root -D test
+mysql -h 127.0.0.1 -P 4000 -u root -D test --prompt="tidb> " 
 ```

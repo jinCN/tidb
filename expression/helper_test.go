@@ -1,171 +1,154 @@
+// Copyright 2016 PingCAP, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package expression
 
 import (
-	"errors"
+	"strings"
+	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/parser/opcode"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/types"
+	driver "github.com/pingcap/tidb/types/parser_driver"
+	"github.com/pingcap/tidb/util/mock"
 )
 
-var _ = Suite(&testHelperSuite{})
+func (s *testExpressionSuite) TestGetTimeValue(c *C) {
+	ctx := mock.NewContext()
+	v, err := GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, types.MinFsp)
+	c.Assert(err, IsNil)
 
-type testHelperSuite struct {
-}
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue := v.GetMysqlTime()
+	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
+	sessionVars := ctx.GetSessionVars()
+	variable.SetSessionSystemVar(sessionVars, "timestamp", types.NewStringDatum(""))
+	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, types.MinFsp)
+	c.Assert(err, IsNil)
 
-func (s *testHelperSuite) TestContainAggFunc(c *C) {
-	v := Value{}
-	tbl := []struct {
-		Expr   Expression
-		Expect bool
-	}{
-		{Value{1}, false},
-		{&BinaryOperation{L: v, R: v}, false},
-		{&Call{F: "count", Args: []Expression{v}}, true},
-		{&Call{F: "abs", Args: []Expression{v}}, false},
-		{&IsNull{Expr: v}, false},
-		{&PExpr{Expr: v}, false},
-		{&PatternIn{Expr: v, List: []Expression{v}}, false},
-		{&PatternLike{Expr: v, Pattern: v}, false},
-		{&UnaryOperation{V: v}, false},
-		{&ParamMarker{Expr: v}, false},
-		{&FunctionCast{Expr: v}, false},
-		{&FunctionConvert{Expr: v}, false},
-		{&FunctionSubstring{StrExpr: v, Pos: v, Len: v}, false},
-		{&FunctionCase{Value: v, WhenClauses: []*WhenClause{{Expr: v, Result: v}}, ElseClause: v}, false},
-		{&WhenClause{Expr: v, Result: v}, false},
-		{&IsTruth{Expr: v}, false},
-		{&Between{Expr: v, Left: v, Right: v}, false},
-		{&Row{Values: []Expression{v, v}}, false},
-	}
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue = v.GetMysqlTime()
+	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
-	for _, t := range tbl {
-		b := ContainAggregateFunc(t.Expr)
-		c.Assert(b, Equals, t.Expect)
-	}
+	variable.SetSessionSystemVar(sessionVars, "timestamp", types.NewStringDatum("0"))
+	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, types.MinFsp)
+	c.Assert(err, IsNil)
 
-	expr := &Call{
-		F: "count",
-		Args: []Expression{
-			&Call{F: "count", Args: []Expression{v}},
-		},
-	}
-	_, err := MentionedAggregateFuncs(expr)
-	c.Assert(err, NotNil)
-}
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue = v.GetMysqlTime()
+	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
-func (s *testHelperSuite) TestMentionedColumns(c *C) {
-	v := Value{}
-	tbl := []struct {
-		Expr   Expression
-		Expect int
-	}{
-		{Value{1}, 0},
-		{&BinaryOperation{L: v, R: v}, 0},
-		{&Ident{CIStr: model.NewCIStr("id")}, 1},
-		{&Call{F: "count", Args: []Expression{v}}, 0},
-		{&IsNull{Expr: v}, 0},
-		{&PExpr{Expr: v}, 0},
-		{&PatternIn{Expr: v, List: []Expression{v}}, 0},
-		{&PatternLike{Expr: v, Pattern: v}, 0},
-		{&UnaryOperation{V: v}, 0},
-		{&ParamMarker{Expr: v}, 0},
-		{&FunctionCast{Expr: v}, 0},
-		{&FunctionConvert{Expr: v}, 0},
-		{&FunctionSubstring{StrExpr: v, Pos: v, Len: v}, 0},
-		{&FunctionCase{Value: v, WhenClauses: []*WhenClause{{Expr: v, Result: v}}, ElseClause: v}, 0},
-		{&WhenClause{Expr: v, Result: v}, 0},
-		{&IsTruth{Expr: v}, 0},
-		{&Between{Expr: v, Left: v, Right: v}, 0},
-		{&Row{Values: []Expression{v, v}}, 0},
-	}
+	variable.SetSessionSystemVar(sessionVars, "timestamp", types.Datum{})
+	v, err = GetTimeValue(ctx, "2012-12-12 00:00:00", mysql.TypeTimestamp, types.MinFsp)
+	c.Assert(err, IsNil)
 
-	for _, t := range tbl {
-		ret := MentionedColumns(t.Expr)
-		c.Assert(ret, HasLen, t.Expect)
-	}
-}
+	c.Assert(v.Kind(), Equals, types.KindMysqlTime)
+	timeValue = v.GetMysqlTime()
+	c.Assert(timeValue.String(), Equals, "2012-12-12 00:00:00")
 
-func NewTestRow(v1 interface{}, v2 interface{}, args ...interface{}) *Row {
-	r := &Row{}
-	a := make([]Expression, len(args))
-	for i := range a {
-		a[i] = Value{args[i]}
-	}
-	r.Values = append([]Expression{Value{v1}, Value{v2}}, a...)
-	return r
-}
-
-func (s *testHelperSuite) TestBase(c *C) {
-	e1 := Value{1}
-	e2 := &PExpr{Expr: e1}
-
-	e3 := Expr(e2)
-	c.Assert(e1, DeepEquals, e3)
+	variable.SetSessionSystemVar(sessionVars, "timestamp", types.NewStringDatum("1234"))
 
 	tbl := []struct {
 		Expr interface{}
 		Ret  interface{}
 	}{
-		{Value{1}, 1},
-		{int64(1), int64(1)},
-		{&UnaryOperation{Op: opcode.Plus, V: Value{1}}, 1},
-		{&UnaryOperation{Op: opcode.Not, V: Value{1}}, nil},
-		{&UnaryOperation{Op: opcode.Plus, V: &Ident{CIStr: model.NewCIStr("id")}}, nil},
-		{nil, nil},
+		{"2012-12-12 00:00:00", "2012-12-12 00:00:00"},
+		{ast.CurrentTimestamp, time.Unix(1234, 0).Format(types.TimeFormat)},
+		{types.ZeroDatetimeStr, "0000-00-00 00:00:00"},
+		{ast.NewValueExpr("2012-12-12 00:00:00", charset.CharsetUTF8MB4, charset.CollationUTF8MB4), "2012-12-12 00:00:00"},
+		{ast.NewValueExpr(int64(0), "", ""), "0000-00-00 00:00:00"},
+		{ast.NewValueExpr(nil, "", ""), nil},
+		{&ast.FuncCallExpr{FnName: model.NewCIStr(ast.CurrentTimestamp)}, strings.ToUpper(ast.CurrentTimestamp)},
+		// {&ast.UnaryOperationExpr{Op: opcode.Minus, V: ast.NewValueExpr(int64(0))}, "0000-00-00 00:00:00"},
 	}
 
-	for _, t := range tbl {
-		v := FastEval(t.Expr)
-		c.Assert(v, DeepEquals, t.Ret)
+	for i, t := range tbl {
+		comment := Commentf("expr: %d", i)
+		v, err := GetTimeValue(ctx, t.Expr, mysql.TypeTimestamp, types.MinFsp)
+		c.Assert(err, IsNil)
+
+		switch v.Kind() {
+		case types.KindMysqlTime:
+			c.Assert(v.GetMysqlTime().String(), DeepEquals, t.Ret, comment)
+		default:
+			c.Assert(v.GetValue(), DeepEquals, t.Ret, comment)
+		}
 	}
 
-	v, err := EvalBoolExpr(nil, Value{1}, nil)
-	c.Assert(v, IsTrue)
-
-	v, err = EvalBoolExpr(nil, Value{nil}, nil)
-	c.Assert(v, IsFalse)
-
-	v, err = EvalBoolExpr(nil, Value{errors.New("must error")}, nil)
-	c.Assert(err, NotNil)
-
-	v, err = EvalBoolExpr(nil, mockExpr{err: errors.New("must error")}, nil)
-	c.Assert(err, NotNil)
-
-	err = CheckOneColumn(nil, &Row{})
-	c.Assert(err, NotNil)
-
-	err = CheckOneColumn(nil, Value{nil})
-	c.Assert(err, IsNil)
-
-	//	err = CheckOneColumn(nil, newMockSubQuery([][]interface{}{}, []string{"id", "name"}))
-	//	c.Assert(err, NotNil)
-
-	columns := []struct {
-		lhs     Expression
-		rhs     Expression
-		checker Checker
+	errTbl := []struct {
+		Expr interface{}
 	}{
-		{Value{nil}, Value{nil}, IsNil},
-		{Value{nil}, &Row{}, NotNil},
-		{NewTestRow(1, 2), NewTestRow(1, 2), IsNil},
-		{NewTestRow(1, 2, 3), NewTestRow(1, 2), NotNil},
+		{"2012-13-12 00:00:00"},
+		{ast.NewValueExpr("2012-13-12 00:00:00", charset.CharsetUTF8MB4, charset.CollationUTF8MB4)},
+		{ast.NewValueExpr(int64(1), "", "")},
+		{&ast.FuncCallExpr{FnName: model.NewCIStr("xxx")}},
+		// {&ast.UnaryOperationExpr{Op: opcode.Minus, V: ast.NewValueExpr(int64(1))}},
 	}
 
-	for _, t := range columns {
-		err = hasSameColumnCount(nil, t.lhs, t.rhs)
-		c.Assert(err, t.checker)
-
-		err = hasSameColumnCount(nil, t.rhs, t.lhs)
-		c.Assert(err, t.checker)
+	for _, t := range errTbl {
+		_, err := GetTimeValue(ctx, t.Expr, mysql.TypeTimestamp, types.MinFsp)
+		c.Assert(err, NotNil)
 	}
 }
 
-func convert(v interface{}) interface{} {
-	switch x := v.(type) {
-	case int:
-		return int64(x)
+func (s *testExpressionSuite) TestIsCurrentTimestampExpr(c *C) {
+	buildTimestampFuncCallExpr := func(i int64) *ast.FuncCallExpr {
+		var args []ast.ExprNode
+		if i != 0 {
+			args = []ast.ExprNode{&driver.ValueExpr{Datum: types.NewIntDatum(i)}}
+		}
+		return &ast.FuncCallExpr{FnName: model.NewCIStr("CURRENT_TIMESTAMP"), Args: args}
 	}
 
-	return v
+	v := IsValidCurrentTimestampExpr(ast.NewValueExpr("abc", charset.CharsetUTF8MB4, charset.CollationUTF8MB4), nil)
+	c.Assert(v, IsFalse)
+	v = IsValidCurrentTimestampExpr(buildTimestampFuncCallExpr(0), nil)
+	c.Assert(v, IsTrue)
+	v = IsValidCurrentTimestampExpr(buildTimestampFuncCallExpr(3), &types.FieldType{Decimal: 3})
+	c.Assert(v, IsTrue)
+	v = IsValidCurrentTimestampExpr(buildTimestampFuncCallExpr(1), &types.FieldType{Decimal: 3})
+	c.Assert(v, IsFalse)
+	v = IsValidCurrentTimestampExpr(buildTimestampFuncCallExpr(0), &types.FieldType{Decimal: 3})
+	c.Assert(v, IsFalse)
+	v = IsValidCurrentTimestampExpr(buildTimestampFuncCallExpr(2), &types.FieldType{Decimal: 0})
+	c.Assert(v, IsFalse)
+	v = IsValidCurrentTimestampExpr(buildTimestampFuncCallExpr(2), nil)
+	c.Assert(v, IsFalse)
+}
+
+func (s *testExpressionSuite) TestCurrentTimestampTimeZone(c *C) {
+	ctx := mock.NewContext()
+	sessionVars := ctx.GetSessionVars()
+
+	variable.SetSessionSystemVar(sessionVars, "timestamp", types.NewStringDatum("1234"))
+	variable.SetSessionSystemVar(sessionVars, "time_zone", types.NewStringDatum("+00:00"))
+	v, err := GetTimeValue(ctx, ast.CurrentTimestamp, mysql.TypeTimestamp, types.MinFsp)
+	c.Assert(err, IsNil)
+	c.Assert(v.GetMysqlTime(), DeepEquals, types.NewTime(
+		types.FromDate(1970, 1, 1, 0, 20, 34, 0),
+		mysql.TypeTimestamp, types.DefaultFsp))
+
+	// CurrentTimestamp from "timestamp" session variable is based on UTC, so change timezone
+	// would get different value.
+	variable.SetSessionSystemVar(sessionVars, "time_zone", types.NewStringDatum("+08:00"))
+	v, err = GetTimeValue(ctx, ast.CurrentTimestamp, mysql.TypeTimestamp, types.MinFsp)
+	c.Assert(err, IsNil)
+	c.Assert(v.GetMysqlTime(), DeepEquals, types.NewTime(
+		types.FromDate(1970, 1, 1, 8, 20, 34, 0),
+		mysql.TypeTimestamp, types.DefaultFsp))
 }

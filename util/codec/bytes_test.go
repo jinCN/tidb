@@ -15,6 +15,7 @@ package codec
 
 import (
 	. "github.com/pingcap/check"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
 var _ = Suite(&testBytesSuite{})
@@ -22,7 +23,20 @@ var _ = Suite(&testBytesSuite{})
 type testBytesSuite struct {
 }
 
+func (s *testBytesSuite) TestFastSlowFastReverse(c *C) {
+	if !supportsUnaligned {
+		return
+	}
+	b := []byte{1, 2, 3, 4, 5, 6, 7, 8, 255, 0, 0, 0, 0, 0, 0, 0, 0, 247}
+	r1 := b
+	fastReverseBytes(b)
+	r2 := b
+	reverseBytes(r2)
+	c.Assert(r1, BytesEquals, r2)
+}
+
 func (s *testBytesSuite) TestBytesCodec(c *C) {
+	defer testleak.AfterTest(c)()
 	inputs := []struct {
 		enc  []byte
 		dec  []byte
@@ -47,16 +61,19 @@ func (s *testBytesSuite) TestBytesCodec(c *C) {
 	}
 
 	for _, input := range inputs {
+
+		c.Assert(EncodedBytesLength(len(input.enc)), Equals, len(input.dec))
+
 		if input.desc {
 			b := EncodeBytesDesc(nil, input.enc)
 			c.Assert(b, BytesEquals, input.dec)
-			_, d, err := DecodeBytesDesc(b)
+			_, d, err := DecodeBytesDesc(b, nil)
 			c.Assert(err, IsNil)
 			c.Assert(d, BytesEquals, input.enc)
 		} else {
 			b := EncodeBytes(nil, input.enc)
 			c.Assert(b, BytesEquals, input.dec)
-			_, d, err := DecodeBytes(b)
+			_, d, err := DecodeBytes(b, nil)
 			c.Assert(err, IsNil)
 			c.Assert(d, BytesEquals, input.enc)
 		}
@@ -76,7 +93,7 @@ func (s *testBytesSuite) TestBytesCodec(c *C) {
 	}
 
 	for _, input := range errInputs {
-		_, _, err := DecodeBytes(input)
+		_, _, err := DecodeBytes(input, nil)
 		c.Assert(err, NotNil)
 	}
 }

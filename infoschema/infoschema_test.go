@@ -14,18 +14,28 @@
 package infoschema_test
 
 import (
+	"context"
+	"sync"
 	"testing"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/ddl/placement"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
-	"github.com/pingcap/tidb/util/types"
+	"github.com/pingcap/tidb/kv"
+	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util"
+	"github.com/pingcap/tidb/util/testleak"
+	"github.com/pingcap/tidb/util/testutil"
 )
 
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
 	TestingT(t)
 }
 
@@ -35,10 +45,14 @@ type testSuite struct {
 }
 
 func (*testSuite) TestT(c *C) {
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
+	defer testleak.AfterTest(c)()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	defer store.Close()
+	// Make sure it calls perfschema.Init().
+	dom, err := session.BootstrapSession(store)
+	c.Assert(err, IsNil)
+	defer dom.Close()
 
 	handle := infoschema.NewHandle(store)
 	dbName := model.NewCIStr("Test")
@@ -47,8 +61,10 @@ func (*testSuite) TestT(c *C) {
 	idxName := model.NewCIStr("idx")
 	noexist := model.NewCIStr("noexist")
 
+	colID, err := genGlobalID(store)
+	c.Assert(err, IsNil)
 	colInfo := &model.ColumnInfo{
-		ID:        3,
+		ID:        colID,
 		Name:      colName,
 		Offset:    0,
 		FieldType: *types.NewFieldType(mysql.TypeLonglong),
@@ -70,43 +86,61 @@ func (*testSuite) TestT(c *C) {
 		State:   model.StatePublic,
 	}
 
+	tbID, err := genGlobalID(store)
+	c.Assert(err, IsNil)
 	tblInfo := &model.TableInfo{
-		ID:      2,
+		ID:      tbID,
 		Name:    tbName,
 		Columns: []*model.ColumnInfo{colInfo},
 		Indices: []*model.IndexInfo{idxInfo},
 		State:   model.StatePublic,
 	}
 
+	dbID, err := genGlobalID(store)
+	c.Assert(err, IsNil)
 	dbInfo := &model.DBInfo{
-		ID:     1,
+		ID:     dbID,
 		Name:   dbName,
 		Tables: []*model.TableInfo{tblInfo},
 		State:  model.StatePublic,
 	}
 
 	dbInfos := []*model.DBInfo{dbInfo}
+	err = kv.RunInNewTxn(context.Background(), store, true, func(ctx context.Context, txn kv.Transaction) error {
+		meta.NewMeta(txn).CreateDatabase(dbInfo)
+		return errors.Trace(err)
+	})
+	c.Assert(err, IsNil)
 
-	handle.Set(dbInfos, 1)
+	builder, err := infoschema.NewBuilder(handle).InitWithDBInfos(dbInfos, nil, 1)
+	c.Assert(err, IsNil)
+
+	txn, err := store.Begin()
+	c.Assert(err, IsNil)
+	checkApplyCreateNonExistsSchemaDoesNotPanic(c, txn, builder)
+	checkApplyCreateNonExistsTableDoesNotPanic(c, txn, builder, dbID)
+	txn.Rollback()
+
+	builder.Build()
 	is := handle.Get()
 
 	schemaNames := is.AllSchemaNames()
-	c.Assert(len(schemaNames), Equals, 1)
-	c.Assert(schemaNames[0], Equals, "Test")
+	c.Assert(schemaNames, HasLen, 4)
+	c.Assert(testutil.CompareUnorderedStringSlice(schemaNames, []string{util.InformationSchemaName.O, util.MetricSchemaName.O, util.PerformanceSchemaName.O, "Test"}), IsTrue)
 
 	schemas := is.AllSchemas()
-	c.Assert(len(schemas), Equals, 1)
+	c.Assert(schemas, HasLen, 4)
 	schemas = is.Clone()
-	c.Assert(len(schemas), Equals, 1)
+	c.Assert(schemas, HasLen, 4)
 
 	c.Assert(is.SchemaExists(dbName), IsTrue)
 	c.Assert(is.SchemaExists(noexist), IsFalse)
 
-	schema, ok := is.SchemaByID(1)
+	schema, ok := is.SchemaByID(dbID)
 	c.Assert(ok, IsTrue)
 	c.Assert(schema, NotNil)
 
-	schema, ok = is.SchemaByID(2)
+	schema, ok = is.SchemaByID(tbID)
 	c.Assert(ok, IsFalse)
 	c.Assert(schema, IsNil)
 
@@ -118,54 +152,266 @@ func (*testSuite) TestT(c *C) {
 	c.Assert(ok, IsFalse)
 	c.Assert(schema, IsNil)
 
+	schema, ok = is.SchemaByTable(tblInfo)
+	c.Assert(ok, IsTrue)
+	c.Assert(schema, NotNil)
+
+	noexistTblInfo := &model.TableInfo{ID: 12345, Name: tblInfo.Name}
+	schema, ok = is.SchemaByTable(noexistTblInfo)
+	c.Assert(ok, IsFalse)
+	c.Assert(schema, IsNil)
+
 	c.Assert(is.TableExists(dbName, tbName), IsTrue)
 	c.Assert(is.TableExists(dbName, noexist), IsFalse)
+	c.Assert(is.TableIsView(dbName, tbName), IsFalse)
+	c.Assert(is.TableIsSequence(dbName, tbName), IsFalse)
 
-	tb, ok := is.TableByID(2)
+	tb, ok := is.TableByID(tbID)
 	c.Assert(ok, IsTrue)
 	c.Assert(tb, NotNil)
 
-	tb, ok = is.TableByID(3)
+	tb, ok = is.TableByID(dbID)
 	c.Assert(ok, IsFalse)
 	c.Assert(tb, IsNil)
+
+	alloc, ok := is.AllocByID(tbID)
+	c.Assert(ok, IsTrue)
+	c.Assert(alloc, NotNil)
 
 	tb, err = is.TableByName(dbName, tbName)
 	c.Assert(err, IsNil)
 	c.Assert(tb, NotNil)
 
-	tb, err = is.TableByName(dbName, noexist)
+	_, err = is.TableByName(dbName, noexist)
 	c.Assert(err, NotNil)
 
-	c.Assert(is.ColumnExists(dbName, tbName, colName), IsTrue)
-	c.Assert(is.ColumnExists(dbName, tbName, noexist), IsFalse)
-
-	col, ok := is.ColumnByID(3)
-	c.Assert(ok, IsTrue)
-	c.Assert(col, NotNil)
-
-	col, ok = is.ColumnByID(5)
-	c.Assert(ok, IsFalse)
-	c.Assert(col, IsNil)
-
-	col, ok = is.ColumnByName(dbName, tbName, colName)
-	c.Assert(ok, IsTrue)
-	c.Assert(col, NotNil)
-
-	col, ok = is.ColumnByName(dbName, tbName, noexist)
-	c.Assert(ok, IsFalse)
-	c.Assert(col, IsNil)
-
-	indices, ok := is.ColumnIndicesByID(3)
-	c.Assert(ok, IsTrue)
-	c.Assert(len(indices), Equals, 1)
-
 	tbs := is.SchemaTables(dbName)
-	c.Assert(len(tbs), Equals, 1)
+	c.Assert(tbs, HasLen, 1)
 
 	tbs = is.SchemaTables(noexist)
-	c.Assert(len(tbs), Equals, 0)
+	c.Assert(tbs, HasLen, 0)
 
-	idx, ok := is.IndexByName(dbName, tbName, idxName)
+	// Make sure partitions table exists
+	tb, err = is.TableByName(model.NewCIStr("information_schema"), model.NewCIStr("partitions"))
+	c.Assert(err, IsNil)
+	c.Assert(tb, NotNil)
+
+	err = kv.RunInNewTxn(context.Background(), store, true, func(ctx context.Context, txn kv.Transaction) error {
+		meta.NewMeta(txn).CreateTableOrView(dbID, tblInfo)
+		return errors.Trace(err)
+	})
+	c.Assert(err, IsNil)
+	txn, err = store.Begin()
+	c.Assert(err, IsNil)
+	_, err = builder.ApplyDiff(meta.NewMeta(txn), &model.SchemaDiff{Type: model.ActionRenameTable, SchemaID: dbID, TableID: tbID, OldSchemaID: dbID})
+	c.Assert(err, IsNil)
+	txn.Rollback()
+	builder.Build()
+	is = handle.Get()
+	schema, ok = is.SchemaByID(dbID)
 	c.Assert(ok, IsTrue)
-	c.Assert(idx, NotNil)
+	c.Assert(len(schema.Tables), Equals, 1)
+
+	emptyHandle := handle.EmptyClone()
+	c.Assert(emptyHandle.Get(), IsNil)
+}
+
+func (testSuite) TestMockInfoSchema(c *C) {
+	tblID := int64(1234)
+	tblName := model.NewCIStr("tbl_m")
+	tableInfo := &model.TableInfo{
+		ID:    tblID,
+		Name:  tblName,
+		State: model.StatePublic,
+	}
+	colInfo := &model.ColumnInfo{
+		State:     model.StatePublic,
+		Offset:    0,
+		Name:      model.NewCIStr("h"),
+		FieldType: *types.NewFieldType(mysql.TypeLong),
+		ID:        1,
+	}
+	tableInfo.Columns = []*model.ColumnInfo{colInfo}
+	is := infoschema.MockInfoSchema([]*model.TableInfo{tableInfo})
+	tbl, ok := is.TableByID(tblID)
+	c.Assert(ok, IsTrue)
+	c.Assert(tbl.Meta().Name, Equals, tblName)
+	c.Assert(tbl.Cols()[0].ColumnInfo, Equals, colInfo)
+}
+
+func checkApplyCreateNonExistsSchemaDoesNotPanic(c *C, txn kv.Transaction, builder *infoschema.Builder) {
+	m := meta.NewMeta(txn)
+	_, err := builder.ApplyDiff(m, &model.SchemaDiff{Type: model.ActionCreateSchema, SchemaID: 999})
+	c.Assert(infoschema.ErrDatabaseNotExists.Equal(err), IsTrue)
+}
+
+func checkApplyCreateNonExistsTableDoesNotPanic(c *C, txn kv.Transaction, builder *infoschema.Builder, dbID int64) {
+	m := meta.NewMeta(txn)
+	_, err := builder.ApplyDiff(m, &model.SchemaDiff{Type: model.ActionCreateTable, SchemaID: dbID, TableID: 999})
+	c.Assert(infoschema.ErrTableNotExists.Equal(err), IsTrue)
+}
+
+// TestConcurrent makes sure it is safe to concurrently create handle on multiple stores.
+func (testSuite) TestConcurrent(c *C) {
+	defer testleak.AfterTest(c)()
+	storeCount := 5
+	stores := make([]kv.Storage, storeCount)
+	for i := 0; i < storeCount; i++ {
+		store, err := mockstore.NewMockStore()
+		c.Assert(err, IsNil)
+		stores[i] = store
+	}
+	defer func() {
+		for _, store := range stores {
+			store.Close()
+		}
+	}()
+	var wg sync.WaitGroup
+	wg.Add(storeCount)
+	for _, store := range stores {
+		go func(s kv.Storage) {
+			defer wg.Done()
+			_ = infoschema.NewHandle(s)
+		}(store)
+	}
+	wg.Wait()
+}
+
+// TestInfoTables makes sure that all tables of information_schema could be found in infoschema handle.
+func (*testSuite) TestInfoTables(c *C) {
+	defer testleak.AfterTest(c)()
+	store, err := mockstore.NewMockStore()
+	c.Assert(err, IsNil)
+	defer store.Close()
+	handle := infoschema.NewHandle(store)
+	builder, err := infoschema.NewBuilder(handle).InitWithDBInfos(nil, nil, 0)
+	c.Assert(err, IsNil)
+	builder.Build()
+	is := handle.Get()
+	c.Assert(is, NotNil)
+
+	infoTables := []string{
+		"SCHEMATA",
+		"TABLES",
+		"COLUMNS",
+		"STATISTICS",
+		"CHARACTER_SETS",
+		"COLLATIONS",
+		"FILES",
+		"PROFILING",
+		"PARTITIONS",
+		"KEY_COLUMN_USAGE",
+		"REFERENTIAL_CONSTRAINTS",
+		"SESSION_VARIABLES",
+		"PLUGINS",
+		"TABLE_CONSTRAINTS",
+		"TRIGGERS",
+		"USER_PRIVILEGES",
+		"ENGINES",
+		"VIEWS",
+		"ROUTINES",
+		"SCHEMA_PRIVILEGES",
+		"COLUMN_PRIVILEGES",
+		"TABLE_PRIVILEGES",
+		"PARAMETERS",
+		"EVENTS",
+		"GLOBAL_STATUS",
+		"GLOBAL_VARIABLES",
+		"SESSION_STATUS",
+		"OPTIMIZER_TRACE",
+		"TABLESPACES",
+		"COLLATION_CHARACTER_SET_APPLICABILITY",
+		"PROCESSLIST",
+	}
+	for _, t := range infoTables {
+		tb, err1 := is.TableByName(util.InformationSchemaName, model.NewCIStr(t))
+		c.Assert(err1, IsNil)
+		c.Assert(tb, NotNil)
+	}
+}
+
+func genGlobalID(store kv.Storage) (int64, error) {
+	var globalID int64
+	err := kv.RunInNewTxn(context.Background(), store, true, func(ctx context.Context, txn kv.Transaction) error {
+		var err error
+		globalID, err = meta.NewMeta(txn).GenGlobalID()
+		return errors.Trace(err)
+	})
+	return globalID, errors.Trace(err)
+}
+
+func (*testSuite) TestGetBundle(c *C) {
+	defer testleak.AfterTest(c)()
+	store, err := mockstore.NewMockStore()
+	c.Assert(err, IsNil)
+	defer store.Close()
+
+	handle := infoschema.NewHandle(store)
+	builder, err := infoschema.NewBuilder(handle).InitWithDBInfos(nil, nil, 0)
+	c.Assert(err, IsNil)
+	builder.Build()
+
+	is := handle.Get()
+
+	bundle := &placement.Bundle{
+		ID: placement.PDBundleID,
+		Rules: []*placement.Rule{
+			{
+				GroupID: placement.PDBundleID,
+				ID:      "default",
+				Role:    "voter",
+				Count:   3,
+			},
+		},
+	}
+	is.SetBundle(bundle)
+
+	b := infoschema.GetBundle(is, []int64{})
+	c.Assert(b.Rules, DeepEquals, bundle.Rules)
+
+	// bundle itself is cloned
+	b.ID = "test"
+	c.Assert(bundle.ID, Equals, placement.PDBundleID)
+
+	ptID := placement.GroupID(3)
+	bundle = &placement.Bundle{
+		ID: ptID,
+		Rules: []*placement.Rule{
+			{
+				GroupID: ptID,
+				ID:      "default",
+				Role:    "voter",
+				Count:   4,
+			},
+		},
+	}
+	is.SetBundle(bundle)
+
+	b = infoschema.GetBundle(is, []int64{2, 3})
+	c.Assert(b, DeepEquals, bundle)
+
+	// bundle itself is cloned
+	b.ID = "test"
+	c.Assert(bundle.ID, Equals, ptID)
+
+	ptID = placement.GroupID(1)
+	bundle = &placement.Bundle{
+		ID: ptID,
+		Rules: []*placement.Rule{
+			{
+				GroupID: ptID,
+				ID:      "default",
+				Role:    "voter",
+				Count:   4,
+			},
+		},
+	}
+	is.SetBundle(bundle)
+
+	b = infoschema.GetBundle(is, []int64{1, 2, 3})
+	c.Assert(b, DeepEquals, bundle)
+
+	// bundle itself is cloned
+	b.ID = "test"
+	c.Assert(bundle.ID, Equals, ptID)
 }

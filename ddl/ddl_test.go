@@ -11,344 +11,280 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package ddl_test
+package ddl
 
 import (
+	"context"
+	"os"
 	"testing"
+	"time"
 
-	"github.com/ngaut/log"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/executor"
-	"github.com/pingcap/tidb/infoschema"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/domain/infosync"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/parser"
-	"github.com/pingcap/tidb/parser/coldef"
+	"github.com/pingcap/tidb/meta"
+	"github.com/pingcap/tidb/meta/autoid"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/stmt"
-	"github.com/pingcap/tidb/stmt/stmts"
-	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/tidb/util/testleak"
 )
 
+type DDLForTest interface {
+	// SetHook sets the hook.
+	SetHook(h Callback)
+	// SetInterceptor sets the interceptor.
+	SetInterceptor(h Interceptor)
+}
+
+// SetHook implements DDL.SetHook interface.
+func (d *ddl) SetHook(h Callback) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.mu.hook = h
+}
+
+// SetInterceptor implements DDL.SetInterceptor interface.
+func (d *ddl) SetInterceptor(i Interceptor) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.mu.interceptor = i
+}
+
+// generalWorker returns the general worker.
+func (d *ddl) generalWorker() *worker {
+	return d.workers[generalWorker]
+}
+
 func TestT(t *testing.T) {
+	CustomVerboseFlag = true
+	*CustomParallelSuiteFlag = true
+	logLevel := os.Getenv("log_level")
+	logutil.InitLogger(logutil.NewLogConfig(logLevel, "", "", logutil.EmptyFileLogConfig, false))
+	autoid.SetStep(5000)
+	ReorgWaitTimeout = 30 * time.Millisecond
+	batchInsertDeleteRangeSize = 2
+
+	config.UpdateGlobal(func(conf *config.Config) {
+		// Test for table lock.
+		conf.EnableTableLock = true
+		conf.Log.SlowThreshold = 10000
+		// Test for add/drop primary key.
+		conf.AlterPrimaryKey = true
+		conf.TiKVClient.AsyncCommit.SafeWindow = 0
+		conf.TiKVClient.AsyncCommit.AllowedClockDrift = 0
+	})
+
+	_, err := infosync.GlobalInfoSyncerInit(context.Background(), "t", func() uint64 { return 1 }, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testleak.BeforeTest()
 	TestingT(t)
+	testleak.AfterTestT(t)()
 }
 
-var _ = Suite(&testSuite{})
-
-type testSuite struct {
-	store       kv.Storage
-	charsetInfo *coldef.CharsetOpt
-}
-
-func (ts *testSuite) SetUpSuite(c *C) {
-	store, err := tidb.NewStore(tidb.EngineGoLevelDBMemory)
+func testNewDDLAndStart(ctx context.Context, c *C, options ...Option) *ddl {
+	d := newDDL(ctx, options...)
+	err := d.Start(nil)
 	c.Assert(err, IsNil)
-	ts.store = store
-	ts.charsetInfo = &coldef.CharsetOpt{
-		Chs: "utf8",
-		Col: "utf8_bin",
+
+	return d
+}
+
+func testCreateStore(c *C, name string) kv.Storage {
+	store, err := mockstore.NewMockStore()
+	c.Assert(err, IsNil)
+	return store
+}
+
+func testNewContext(d *ddl) sessionctx.Context {
+	ctx := mock.NewContext()
+	ctx.Store = d.store
+	return ctx
+}
+
+func getSchemaVer(c *C, ctx sessionctx.Context) int64 {
+	err := ctx.NewTxn(context.Background())
+	c.Assert(err, IsNil)
+	txn, err := ctx.Txn(true)
+	c.Assert(err, IsNil)
+	m := meta.NewMeta(txn)
+	ver, err := m.GetSchemaVersion()
+	c.Assert(err, IsNil)
+	return ver
+}
+
+type historyJobArgs struct {
+	ver    int64
+	db     *model.DBInfo
+	tbl    *model.TableInfo
+	tblIDs map[int64]struct{}
+}
+
+func checkEqualTable(c *C, t1, t2 *model.TableInfo) {
+	c.Assert(t1.ID, Equals, t2.ID)
+	c.Assert(t1.Name, Equals, t2.Name)
+	c.Assert(t1.Charset, Equals, t2.Charset)
+	c.Assert(t1.Collate, Equals, t2.Collate)
+	c.Assert(t1.PKIsHandle, DeepEquals, t2.PKIsHandle)
+	c.Assert(t1.Comment, DeepEquals, t2.Comment)
+	c.Assert(t1.AutoIncID, DeepEquals, t2.AutoIncID)
+}
+
+func checkHistoryJob(c *C, job *model.Job) {
+	c.Assert(job.State, Equals, model.JobStateSynced)
+}
+
+func checkHistoryJobArgs(c *C, ctx sessionctx.Context, id int64, args *historyJobArgs) {
+	txn, err := ctx.Txn(true)
+	c.Assert(err, IsNil)
+	t := meta.NewMeta(txn)
+	historyJob, err := t.GetHistoryDDLJob(id)
+	c.Assert(err, IsNil)
+	c.Assert(historyJob.BinlogInfo.FinishedTS, Greater, uint64(0))
+
+	if args.tbl != nil {
+		c.Assert(historyJob.BinlogInfo.SchemaVersion, Equals, args.ver)
+		checkEqualTable(c, historyJob.BinlogInfo.TableInfo, args.tbl)
+		return
 	}
 
+	// for handling schema job
+	c.Assert(historyJob.BinlogInfo.SchemaVersion, Equals, args.ver)
+	c.Assert(historyJob.BinlogInfo.DBInfo, DeepEquals, args.db)
+	// only for creating schema job
+	if args.db != nil && len(args.tblIDs) == 0 {
+		return
+	}
 }
 
-func (ts *testSuite) TestDDL(c *C) {
-	// TODO: rewrite the test.
-	c.Skip("this test assume statement to be `stmts` types, which has changed.")
-	se, _ := tidb.CreateSession(ts.store)
-	ctx := se.(context.Context)
-	schemaName := model.NewCIStr("test_ddl")
-	tblName := model.NewCIStr("t")
-	tbIdent := table.Ident{
-		Schema: schemaName,
-		Name:   tblName,
+func buildCreateIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bool, indexName string, colName string) *model.Job {
+	return &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionAddIndex,
+		BinlogInfo: &model.HistoryInfo{},
+		Args: []interface{}{unique, model.NewCIStr(indexName),
+			[]*ast.IndexPartSpecification{{
+				Column: &ast.ColumnName{Name: model.NewCIStr(colName)},
+				Length: types.UnspecifiedLength}}},
 	}
-	noExist := model.NewCIStr("noexist")
-
-	err := sessionctx.GetDomain(ctx).DDL().CreateSchema(ctx, tbIdent.Schema, ts.charsetInfo)
-	c.Assert(err, IsNil)
-	err = sessionctx.GetDomain(ctx).DDL().CreateSchema(ctx, tbIdent.Schema, ts.charsetInfo)
-	c.Assert(terror.ErrorEqual(err, infoschema.DatabaseExists), IsTrue)
-
-	tbStmt := statement(ctx, "create table t (a int primary key not null, b varchar(255), key idx_b (b), c int, d int unique)").(*stmts.CreateTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, table.Ident{Schema: noExist, Name: tbIdent.Name}, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(infoschema.DatabaseNotExists.Equal(err), IsTrue)
-
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, tbIdent, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(err, IsNil)
-
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, tbIdent, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(terror.ErrorEqual(err, infoschema.TableExists), IsTrue)
-
-	tb, err := sessionctx.GetDomain(ctx).InfoSchema().TableByName(tbIdent.Schema, tbIdent.Name)
-	c.Assert(err, IsNil)
-	c.Assert(tb, NotNil)
-	_, err = tb.AddRecord(ctx, []interface{}{1, "b", 2, 4})
-	c.Assert(err, IsNil)
-
-	alterStmt := statement(ctx, "alter table t add column aa int first").(*stmts.AlterTableStmt)
-	sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(alterStmt.Specs[0].String(), Not(Equals), "")
-
-	tbl, err := sessionctx.GetDomain(ctx).InfoSchema().TableByName(schemaName, tblName)
-	c.Assert(err, IsNil)
-	c.Assert(tbl, NotNil)
-	expectedOffset := make(map[string]int)
-	expectedOffset["a"] = 1
-	expectedOffset["b"] = 2
-	expectedOffset["d"] = 4
-	for _, idx := range tbl.Indices() {
-		for _, col := range idx.Columns {
-			o, ok := expectedOffset[col.Name.L]
-			c.Assert(ok, IsTrue)
-			c.Assert(col.Offset, Equals, o)
-		}
-	}
-
-	alterStmt = statement(ctx, "alter table t add column bb int after b").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, IsNil)
-	c.Assert(alterStmt.Specs[0].String(), Not(Equals), "")
-
-	// Test add a duplicated column to table, get an error.
-	alterStmt = statement(ctx, "alter table t add column bb int after b").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	// Test column schema change in t2.
-	tbIdent2 := tbIdent
-	tbIdent2.Name = model.NewCIStr("t2")
-	tbStmt = statement(ctx, "create table t2 (a int unique not null)").(*stmts.CreateTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, tbIdent2, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(err, IsNil)
-	tb, err = sessionctx.GetDomain(ctx).InfoSchema().TableByName(tbIdent2.Schema, tbIdent2.Name)
-	c.Assert(err, IsNil)
-	c.Assert(tb, NotNil)
-	rid0, err := tb.AddRecord(ctx, []interface{}{1})
-	c.Assert(err, IsNil)
-	rid1, err := tb.AddRecord(ctx, []interface{}{2})
-	c.Assert(err, IsNil)
-
-	alterStmt = statement(ctx, `alter table t2 add b enum("bb") first`).(*stmts.AlterTableStmt)
-	sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent2, alterStmt.Specs)
-	c.Assert(alterStmt.Specs[0].String(), Not(Equals), "")
-	tb, err = sessionctx.GetDomain(ctx).InfoSchema().TableByName(tbIdent2.Schema, tbIdent2.Name)
-	c.Assert(err, IsNil)
-	c.Assert(tb, NotNil)
-	cols, err := tb.Row(ctx, rid0)
-	c.Assert(err, IsNil)
-	c.Assert(len(cols), Equals, 2)
-	c.Assert(cols[0], Equals, nil)
-	c.Assert(cols[1], Equals, int64(1))
-
-	alterStmt = statement(ctx, `alter table t2 add c varchar(255) default "abc" after b`).(*stmts.AlterTableStmt)
-	sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent2, alterStmt.Specs)
-	c.Assert(alterStmt.Specs[0].String(), Not(Equals), "")
-	tb, err = sessionctx.GetDomain(ctx).InfoSchema().TableByName(tbIdent2.Schema, tbIdent2.Name)
-	c.Assert(err, IsNil)
-	c.Assert(tb, NotNil)
-	cols, err = tb.Row(ctx, rid1)
-	c.Assert(err, IsNil)
-	c.Assert(len(cols), Equals, 3)
-	c.Assert(cols[0], Equals, nil)
-	c.Assert(cols[1], BytesEquals, []byte("abc"))
-	c.Assert(cols[2], Equals, int64(2))
-	rid3, err := tb.AddRecord(ctx, []interface{}{mysql.Enum{Name: "bb", Value: 1}, "c", 3})
-	c.Assert(err, IsNil)
-	cols, err = tb.Row(ctx, rid3)
-	c.Assert(err, IsNil)
-	c.Assert(len(cols), Equals, 3)
-	c.Assert(cols[0], Equals, mysql.Enum{Name: "bb", Value: 1})
-	c.Assert(cols[1], BytesEquals, []byte("c"))
-	c.Assert(cols[2], Equals, int64(3))
-
-	// Test add column after a not exist column, get an error.
-	alterStmt = statement(ctx, `alter table t2 add b int after xxxx`).(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent2, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	// Test add column to a not exist table, get an error.
-	tbIdent3 := tbIdent
-	tbIdent3.Name = model.NewCIStr("t3")
-	alterStmt = statement(ctx, `alter table t3 add b int first`).(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent3, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	// Test drop column.
-	alterStmt = statement(ctx, "alter table t2 drop column b").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent2, alterStmt.Specs)
-	c.Assert(err, IsNil)
-	tb, err = sessionctx.GetDomain(ctx).InfoSchema().TableByName(tbIdent2.Schema, tbIdent2.Name)
-	c.Assert(err, IsNil)
-	c.Assert(tb, NotNil)
-
-	cols, err = tb.Row(ctx, rid0)
-	c.Assert(err, IsNil)
-	c.Assert(len(cols), Equals, 2)
-	c.Assert(cols[0], BytesEquals, []byte("abc"))
-	c.Assert(cols[1], Equals, int64(1))
-
-	// Test drop a not exist column from table, get an error.
-	alterStmt = statement(ctx, `alter table t2 drop column xxx`).(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent2, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	// Test drop column from a not exist table, get an error.
-	alterStmt = statement(ctx, `alter table t3 drop column a`).(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent3, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	// Test index schema change.
-	idxStmt := statement(ctx, "CREATE INDEX idx_c ON t (c)").(*stmts.CreateIndexStmt)
-	idxName := model.NewCIStr(idxStmt.IndexName)
-	err = sessionctx.GetDomain(ctx).DDL().CreateIndex(ctx, tbIdent, idxStmt.Unique, idxName, idxStmt.IndexColNames)
-	c.Assert(err, IsNil)
-	tbs := sessionctx.GetDomain(ctx).InfoSchema().SchemaTables(tbIdent.Schema)
-	c.Assert(len(tbs), Equals, 2)
-	err = sessionctx.GetDomain(ctx).DDL().DropIndex(ctx, tbIdent, idxName)
-	c.Assert(err, IsNil)
-
-	alterStmt = statement(ctx, "alter table t add index idx_c (c)").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, IsNil)
-
-	alterStmt = statement(ctx, "alter table t drop index idx_c").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, IsNil)
-
-	alterStmt = statement(ctx, "alter table t add unique index idx_c (c)").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, IsNil)
-
-	alterStmt = statement(ctx, "alter table t drop index idx_c").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, IsNil)
-
-	err = sessionctx.GetDomain(ctx).DDL().DropTable(ctx, tbIdent)
-	c.Assert(err, IsNil)
-
-	tbs = sessionctx.GetDomain(ctx).InfoSchema().SchemaTables(tbIdent.Schema)
-	c.Assert(len(tbs), Equals, 1)
-
-	err = sessionctx.GetDomain(ctx).DDL().DropSchema(ctx, noExist)
-	c.Assert(terror.ErrorEqual(err, infoschema.DatabaseNotExists), IsTrue)
-
-	err = sessionctx.GetDomain(ctx).DDL().DropSchema(ctx, tbIdent.Schema)
-	c.Assert(err, IsNil)
 }
 
-func (ts *testSuite) TestConstraintNames(c *C) {
-	// TODO: rewrite the test.
-	c.Skip("this test assume statement to be `stmts` types, which has changed.")
-	se, _ := tidb.CreateSession(ts.store)
-	ctx := se.(context.Context)
-	schemaName := model.NewCIStr("test_constraint")
-	tblName := model.NewCIStr("t")
-	tbIdent := table.Ident{
-		Schema: schemaName,
-		Name:   tblName,
-	}
-
-	err := sessionctx.GetDomain(ctx).DDL().CreateSchema(ctx, tbIdent.Schema, ts.charsetInfo)
+func testCreatePrimaryKey(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, colName string) *model.Job {
+	job := buildCreateIdxJob(dbInfo, tblInfo, true, "primary", colName)
+	job.Type = model.ActionAddPrimaryKey
+	err := d.doDDLJob(ctx, job)
 	c.Assert(err, IsNil)
-
-	tbStmt := statement(ctx, "create table t (a int, b int, index a (a, b), index a (a))").(*stmts.CreateTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, tbIdent, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(err, NotNil)
-
-	tbStmt = statement(ctx, "create table t (a int, b int, index A (a, b), index (a))").(*stmts.CreateTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, tbIdent, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(err, IsNil)
-	tbl, err := sessionctx.GetDomain(ctx).InfoSchema().TableByName(schemaName, tblName)
-	indices := tbl.Indices()
-	c.Assert(len(indices), Equals, 2)
-	c.Assert(indices[0].Name.O, Equals, "A")
-	c.Assert(indices[1].Name.O, Equals, "a_2")
-
-	err = sessionctx.GetDomain(ctx).DDL().DropSchema(ctx, tbIdent.Schema)
-	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	return job
 }
 
-func (ts *testSuite) TestAlterTableColumn(c *C) {
-	// TODO: rewrite the test.
-	c.Skip("this test assume statement to be `stmts` types, which has changed.")
-	se, _ := tidb.CreateSession(ts.store)
-	ctx := se.(context.Context)
-	schemaName := model.NewCIStr("test_alter_add_column")
-	tbIdent := table.Ident{
-		Schema: schemaName,
-		Name:   model.NewCIStr("t"),
-	}
-
-	err := sessionctx.GetDomain(ctx).DDL().CreateSchema(ctx, tbIdent.Schema, ts.charsetInfo)
+func testCreateIndex(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, unique bool, indexName string, colName string) *model.Job {
+	job := buildCreateIdxJob(dbInfo, tblInfo, unique, indexName, colName)
+	err := d.doDDLJob(ctx, job)
 	c.Assert(err, IsNil)
-
-	tbStmt := statement(ctx, "create table t (a int, b int)").(*stmts.CreateTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, tbIdent, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(err, IsNil)
-
-	alterStmt := statement(ctx, "alter table t add column c int PRIMARY KEY").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	alterStmt = statement(ctx, "alter table t add column c int AUTO_INCREMENT PRIMARY KEY").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	alterStmt = statement(ctx, "alter table t add column c int UNIQUE").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	alterStmt = statement(ctx, "alter table t add column c int UNIQUE KEY").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	alterStmt = statement(ctx, "alter table t add column c int, add column d int").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	// Notice: Now we have not supported.
-	// alterStmt = statement(ctx, "alter table t add column c int KEY").(*stmts.AlterTableStmt)
-	// err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	// c.Assert(err, NotNil)
-
-	tbIdent2 := table.Ident{
-		Schema: schemaName,
-		Name:   model.NewCIStr("t1"),
-	}
-
-	tbStmt = statement(ctx, "create table t1 (a int, b int, c int, d int, index A (a, b))").(*stmts.CreateTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().CreateTable(ctx, tbIdent2, tbStmt.Cols, tbStmt.Constraints)
-	c.Assert(err, IsNil)
-
-	alterStmt = statement(ctx, "alter table t1 drop column a").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent2, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	alterStmt = statement(ctx, "alter table t1 drop column b").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent2, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	alterStmt = statement(ctx, "alter table t1 drop column c, drop column d").(*stmts.AlterTableStmt)
-	err = sessionctx.GetDomain(ctx).DDL().AlterTable(ctx, tbIdent, alterStmt.Specs)
-	c.Assert(err, NotNil)
-
-	err = sessionctx.GetDomain(ctx).DDL().DropSchema(ctx, tbIdent.Schema)
-	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	return job
 }
 
-func statement(ctx context.Context, sql string) stmt.Statement {
-	log.Debug("[ddl] Compile", sql)
-	s, _ := parser.ParseOneStmt(sql, "", "")
-	compiler := &executor.Compiler{}
-	stm, _ := compiler.Compile(ctx, s)
-	return stm
+func testAddColumn(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, args []interface{}) *model.Job {
+	job := &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionAddColumn,
+		Args:       args,
+		BinlogInfo: &model.HistoryInfo{},
+	}
+	err := d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	return job
 }
 
-func init() {
-	log.SetLevelByString("error")
+func testAddColumns(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, args []interface{}) *model.Job {
+	job := &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionAddColumns,
+		Args:       args,
+		BinlogInfo: &model.HistoryInfo{},
+	}
+	err := d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	return job
+}
+
+func buildDropIdxJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, indexName string) *model.Job {
+	tp := model.ActionDropIndex
+	if indexName == "primary" {
+		tp = model.ActionDropPrimaryKey
+	}
+	return &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       tp,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{model.NewCIStr(indexName)},
+	}
+}
+
+func testDropIndex(c *C, ctx sessionctx.Context, d *ddl, dbInfo *model.DBInfo, tblInfo *model.TableInfo, indexName string) *model.Job {
+	job := buildDropIdxJob(dbInfo, tblInfo, indexName)
+	err := d.doDDLJob(ctx, job)
+	c.Assert(err, IsNil)
+	v := getSchemaVer(c, ctx)
+	checkHistoryJobArgs(c, ctx, job.ID, &historyJobArgs{ver: v, tbl: tblInfo})
+	return job
+}
+
+func buildRebaseAutoIDJobJob(dbInfo *model.DBInfo, tblInfo *model.TableInfo, newBaseID int64) *model.Job {
+	return &model.Job{
+		SchemaID:   dbInfo.ID,
+		TableID:    tblInfo.ID,
+		Type:       model.ActionRebaseAutoID,
+		BinlogInfo: &model.HistoryInfo{},
+		Args:       []interface{}{newBaseID},
+	}
+}
+
+func (s *testDDLSuite) TestGetIntervalFromPolicy(c *C) {
+	policy := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+	}
+	var (
+		val     time.Duration
+		changed bool
+	)
+
+	val, changed = getIntervalFromPolicy(policy, 0)
+	c.Assert(val, Equals, 1*time.Second)
+	c.Assert(changed, Equals, true)
+
+	val, changed = getIntervalFromPolicy(policy, 1)
+	c.Assert(val, Equals, 2*time.Second)
+	c.Assert(changed, Equals, true)
+
+	val, changed = getIntervalFromPolicy(policy, 2)
+	c.Assert(val, Equals, 2*time.Second)
+	c.Assert(changed, Equals, false)
+
+	val, changed = getIntervalFromPolicy(policy, 3)
+	c.Assert(val, Equals, 2*time.Second)
+	c.Assert(changed, Equals, false)
 }

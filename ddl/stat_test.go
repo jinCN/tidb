@@ -14,72 +14,88 @@
 package ddl
 
 import (
-	"time"
+	"context"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/util/mock"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/tidb/types"
 )
 
 var _ = Suite(&testStatSuite{})
+var _ = SerialSuites(&testSerialStatSuite{})
 
 type testStatSuite struct {
 }
 
+func (s *testStatSuite) SetUpSuite(c *C) {
+}
+
+func (s *testStatSuite) TearDownSuite(c *C) {
+}
+
+type testSerialStatSuite struct {
+}
+
 func (s *testStatSuite) getDDLSchemaVer(c *C, d *ddl) int64 {
-	m, err := d.Stats()
+	m, err := d.Stats(nil)
 	c.Assert(err, IsNil)
 	v := m[ddlSchemaVersion]
 	return v.(int64)
 }
 
-func (s *testStatSuite) TestStat(c *C) {
+func (s *testSerialStatSuite) TestDDLStatsInfo(c *C) {
 	store := testCreateStore(c, "test_stat")
 	defer store.Close()
 
-	lease := 50 * time.Millisecond
-
-	d := newDDL(store, nil, nil, lease)
-	defer d.close()
-
-	time.Sleep(lease)
+	d := testNewDDLAndStart(
+		context.Background(),
+		c,
+		WithStore(store),
+		WithLease(testLease),
+	)
+	defer d.Stop()
 
 	dbInfo := testSchemaInfo(c, d, "test")
-	testCreateSchema(c, mock.NewContext(), d, dbInfo)
+	testCreateSchema(c, testNewContext(d), d, dbInfo)
+	tblInfo := testTableInfo(c, d, "t", 2)
+	ctx := testNewContext(d)
+	testCreateTable(c, ctx, d, dbInfo, tblInfo)
 
-	m, err := d.Stats()
+	t := testGetTable(c, d, dbInfo.ID, tblInfo.ID)
+	// insert t values (1, 1), (2, 2), (3, 3)
+	_, err := t.AddRecord(ctx, types.MakeDatums(1, 1))
 	c.Assert(err, IsNil)
-	c.Assert(m[ddlOwnerID], Equals, d.uuid)
+	_, err = t.AddRecord(ctx, types.MakeDatums(2, 2))
+	c.Assert(err, IsNil)
+	_, err = t.AddRecord(ctx, types.MakeDatums(3, 3))
+	c.Assert(err, IsNil)
+	txn, err := ctx.Txn(true)
+	c.Assert(err, IsNil)
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
 
-	job := &model.Job{
-		SchemaID: dbInfo.ID,
-		Type:     model.ActionDropSchema,
-		Args:     []interface{}{dbInfo.Name},
-	}
+	job := buildCreateIdxJob(dbInfo, tblInfo, true, "idx", "c1")
 
-	ctx := mock.NewContext()
-	done := make(chan error, 1)
-	go func() {
-		done <- d.startDDLJob(ctx, job)
+	c.Assert(failpoint.Enable("github.com/pingcap/tidb/ddl/checkBackfillWorkerNum", `return(true)`), IsNil)
+	defer func() {
+		c.Assert(failpoint.Disable("github.com/pingcap/tidb/ddl/checkBackfillWorkerNum"), IsNil)
 	}()
 
-	ticker := time.NewTicker(d.lease * 1)
-	defer ticker.Stop()
+	done := make(chan error, 1)
+	go func() {
+		done <- d.doDDLJob(ctx, job)
+	}()
 
-	ver := s.getDDLSchemaVer(c, d)
-LOOP:
-	for {
+	exit := false
+	for !exit {
 		select {
-		case <-ticker.C:
-			d.close()
-			c.Assert(s.getDDLSchemaVer(c, d), GreaterEqual, ver)
-			d.start()
 		case err := <-done:
 			c.Assert(err, IsNil)
-			m, err := d.Stats()
+			exit = true
+		case <-TestCheckWorkerNumCh:
+			varMap, err := d.Stats(nil)
 			c.Assert(err, IsNil)
-			c.Assert(m[bgOwnerID], Equals, d.uuid)
-			break LOOP
+			c.Assert(varMap[ddlJobReorgHandle], Equals, "1")
 		}
 	}
 }

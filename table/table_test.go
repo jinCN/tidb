@@ -1,4 +1,4 @@
-// Copyright 2015 PingCAP, Inc.
+// Copyright 2017 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,46 +11,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package table_test
+package table
 
 import (
-	"testing"
-
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb"
-	"github.com/pingcap/tidb/context"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/sessionctx/db"
-	"github.com/pingcap/tidb/store/localstore"
-	"github.com/pingcap/tidb/store/localstore/goleveldb"
-	"github.com/pingcap/tidb/table"
+	"github.com/pingcap/parser/terror"
+	mysql "github.com/pingcap/tidb/errno"
 )
 
-func TestT(t *testing.T) {
-	TestingT(t)
-}
+var _ = Suite(&testTableSuite{})
 
-var _ = Suite(&testSuite{})
+type testTableSuite struct{}
 
-type testSuite struct {
-}
-
-func (*testSuite) TestT(c *C) {
-	var ident = table.Ident{
-		Name: model.NewCIStr("t"),
-	}
-	c.Assert(ident.String(), Not(Equals), "")
-	driver := localstore.Driver{Driver: goleveldb.MemoryDriver{}}
-	store, err := driver.Open("memory")
-	c.Assert(err, IsNil)
-	se, err := tidb.CreateSession(store)
-	c.Assert(err, IsNil)
-	ctx := se.(context.Context)
-	db.BindCurrentSchema(ctx, "test")
-	fullIdent := ident.Full(ctx)
-	c.Assert(fullIdent.Schema.L, Equals, "test")
-	c.Assert(fullIdent.Name.L, Equals, "t")
-	c.Assert(fullIdent.String(), Not(Equals), "")
-	fullIdent2 := fullIdent.Full(ctx)
-	c.Assert(fullIdent2.Schema.L, Equals, fullIdent.Schema.L)
+func (t *testTableSuite) TestErrorCode(c *C) {
+	c.Assert(int(terror.ToSQLError(ErrColumnCantNull).Code), Equals, mysql.ErrBadNull)
+	c.Assert(int(terror.ToSQLError(ErrUnknownColumn).Code), Equals, mysql.ErrBadField)
+	c.Assert(int(terror.ToSQLError(errDuplicateColumn).Code), Equals, mysql.ErrFieldSpecifiedTwice)
+	c.Assert(int(terror.ToSQLError(errGetDefaultFailed).Code), Equals, mysql.ErrFieldGetDefaultFailed)
+	c.Assert(int(terror.ToSQLError(ErrNoDefaultValue).Code), Equals, mysql.ErrNoDefaultForField)
+	c.Assert(int(terror.ToSQLError(ErrIndexOutBound).Code), Equals, mysql.ErrIndexOutBound)
+	c.Assert(int(terror.ToSQLError(ErrUnsupportedOp).Code), Equals, mysql.ErrUnsupportedOp)
+	c.Assert(int(terror.ToSQLError(ErrRowNotFound).Code), Equals, mysql.ErrRowNotFound)
+	c.Assert(int(terror.ToSQLError(ErrTableStateCantNone).Code), Equals, mysql.ErrTableStateCantNone)
+	c.Assert(int(terror.ToSQLError(ErrColumnStateCantNone).Code), Equals, mysql.ErrColumnStateCantNone)
+	c.Assert(int(terror.ToSQLError(ErrColumnStateNonPublic).Code), Equals, mysql.ErrColumnStateNonPublic)
+	c.Assert(int(terror.ToSQLError(ErrIndexStateCantNone).Code), Equals, mysql.ErrIndexStateCantNone)
+	c.Assert(int(terror.ToSQLError(ErrInvalidRecordKey).Code), Equals, mysql.ErrInvalidRecordKey)
+	c.Assert(int(terror.ToSQLError(ErrTruncatedWrongValueForField).Code), Equals, mysql.ErrTruncatedWrongValueForField)
+	c.Assert(int(terror.ToSQLError(ErrUnknownPartition).Code), Equals, mysql.ErrUnknownPartition)
+	c.Assert(int(terror.ToSQLError(ErrNoPartitionForGivenValue).Code), Equals, mysql.ErrNoPartitionForGivenValue)
+	c.Assert(int(terror.ToSQLError(ErrLockOrActiveTransaction).Code), Equals, mysql.ErrLockOrActiveTransaction)
 }

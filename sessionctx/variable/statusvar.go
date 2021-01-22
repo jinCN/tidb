@@ -14,14 +14,18 @@
 package variable
 
 import (
-	"github.com/juju/errors"
+	"bytes"
+	"crypto/tls"
+	"sync"
+
+	"github.com/pingcap/tidb/util"
 )
 
 var statisticsList []Statistics
-var globalStatusScopes = make(map[string]ScopeFlag)
+var statisticsListLock sync.RWMutex
 
-// DefaultScopeFlag is the status default scope.
-var DefaultScopeFlag = ScopeGlobal | ScopeSession
+// DefaultStatusVarScopeFlag is the default scope of status variables.
+var DefaultStatusVarScopeFlag = ScopeGlobal | ScopeSession
 
 // StatusVal is the value of the corresponding status variable.
 type StatusVal struct {
@@ -34,22 +38,27 @@ type Statistics interface {
 	// GetScope gets the status variables scope.
 	GetScope(status string) ScopeFlag
 	// Stats returns the statistics status variables.
-	Stats() (map[string]interface{}, error)
+	Stats(*SessionVars) (map[string]interface{}, error)
 }
 
 // RegisterStatistics registers statistics.
 func RegisterStatistics(s Statistics) {
+	statisticsListLock.Lock()
 	statisticsList = append(statisticsList, s)
+	statisticsListLock.Unlock()
 }
 
 // GetStatusVars gets registered statistics status variables.
-func GetStatusVars() (map[string]*StatusVal, error) {
+// TODO: Refactor this function to avoid repeated memory allocation / dealloc
+func GetStatusVars(vars *SessionVars) (map[string]*StatusVal, error) {
 	statusVars := make(map[string]*StatusVal)
+	statisticsListLock.RLock()
+	defer statisticsListLock.RUnlock()
 
 	for _, statistics := range statisticsList {
-		vals, err := statistics.Stats()
+		vals, err := statistics.Stats(vars)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 
 		for name, val := range vals {
@@ -59,4 +68,89 @@ func GetStatusVars() (map[string]*StatusVal, error) {
 	}
 
 	return statusVars, nil
+}
+
+// Taken from https://golang.org/pkg/crypto/tls/#pkg-constants .
+var tlsCiphers = []uint16{
+	tls.TLS_RSA_WITH_RC4_128_SHA,
+	tls.TLS_RSA_WITH_3DES_EDE_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_256_CBC_SHA,
+	tls.TLS_RSA_WITH_AES_128_CBC_SHA256,
+	tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+	tls.TLS_ECDHE_RSA_WITH_RC4_128_SHA,
+	tls.TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+	tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+	tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+	tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+	tls.TLS_AES_128_GCM_SHA256,
+	tls.TLS_AES_256_GCM_SHA384,
+	tls.TLS_CHACHA20_POLY1305_SHA256,
+}
+
+var tlsSupportedCiphers string
+
+// Taken from https://github.com/openssl/openssl/blob/c784a838e0947fcca761ee62def7d077dc06d37f/include/openssl/ssl.h#L141 .
+var tlsVersionString = map[uint16]string{
+	tls.VersionSSL30: "SSLv3",
+	tls.VersionTLS10: "TLSv1",
+	tls.VersionTLS11: "TLSv1.1",
+	tls.VersionTLS12: "TLSv1.2",
+	tls.VersionTLS13: "TLSv1.3",
+}
+
+var defaultStatus = map[string]*StatusVal{
+	"Ssl_cipher":      {ScopeGlobal | ScopeSession, ""},
+	"Ssl_cipher_list": {ScopeGlobal | ScopeSession, ""},
+	"Ssl_verify_mode": {ScopeGlobal | ScopeSession, 0},
+	"Ssl_version":     {ScopeGlobal | ScopeSession, ""},
+}
+
+type defaultStatusStat struct {
+}
+
+func (s defaultStatusStat) GetScope(status string) ScopeFlag {
+	return defaultStatus[status].Scope
+}
+
+func (s defaultStatusStat) Stats(vars *SessionVars) (map[string]interface{}, error) {
+	statusVars := make(map[string]interface{}, len(defaultStatus))
+
+	for name, v := range defaultStatus {
+		statusVars[name] = v.Value
+	}
+
+	// `vars` may be nil in unit tests.
+	if vars != nil && vars.TLSConnectionState != nil {
+		statusVars["Ssl_cipher"] = util.TLSCipher2String(vars.TLSConnectionState.CipherSuite)
+		statusVars["Ssl_cipher_list"] = tlsSupportedCiphers
+		// tls.VerifyClientCertIfGiven == SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE
+		statusVars["Ssl_verify_mode"] = 0x01 | 0x04
+		statusVars["Ssl_version"] = tlsVersionString[vars.TLSConnectionState.Version]
+	}
+
+	return statusVars, nil
+}
+
+func init() {
+	var ciphersBuffer bytes.Buffer
+	for _, v := range tlsCiphers {
+		ciphersBuffer.WriteString(util.TLSCipher2String(v))
+		ciphersBuffer.WriteString(":")
+	}
+	tlsSupportedCiphers = ciphersBuffer.String()
+
+	var stat defaultStatusStat
+	RegisterStatistics(stat)
 }
